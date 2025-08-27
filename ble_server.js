@@ -9,7 +9,7 @@ const DEVICE_INFO_CHAR_UUID = '12345678123456789abc123456789abe';
 const CONFIG_PATH = '/etc/smartwardrobe/config.json';
 const DEVICE_NAME = 'SmartWardrobe';
 const DEVICE_SERIAL='0001';
-
+const DEVICE_MAC ='2c:cf:67:c6:97:2c';
 
 if (!fs.existsSync('/etc/smartwardrobe')) {
   try { fs.mkdirSync('/etc/smartwardrobe', { recursive: true }); } catch (e) { console.error(e); }
