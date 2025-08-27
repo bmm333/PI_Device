@@ -13,6 +13,8 @@ from smartcard.util import toHexString
 import threading
 from queue import Queue
 import traceback
+from logging.handlers import RotatingFileHandler
+
 CONFIG_PATH = '/etc/smartwardrobe/config.json'
 LOG_PATH = '/var/log/smartwardrobe_rfid.log'
 ACTIVATION_FLAG = '/etc/smartwardrobe/.activated'
@@ -29,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_PATH, maxBytes=10*1024*1024, backupCount=3),
+        RotatingFileHandler(LOG_PATH, maxBytes=10*1024*1024, backupCount=3),
         logging.StreamHandler()
     ]
 )
