@@ -4,9 +4,12 @@ const { exec } = require('child_process');
 
 const SERVICE_UUID = '12345678123456789abc123456789abc'; // 128-bit, no hyphens
 const WIFI_CHAR_UUID = '12345678123456789abc123456789abd';
+const DEVICE_INFO_CHAR_UUID = '12345678123456789abc123456789abe';
 
 const CONFIG_PATH = '/etc/smartwardrobe/config.json';
 const DEVICE_NAME = 'SmartWardrobe';
+const DEVICE_SERIAL='0001';
+
 
 if (!fs.existsSync('/etc/smartwardrobe')) {
   try { fs.mkdirSync('/etc/smartwardrobe', { recursive: true }); } catch (e) { console.error(e); }
@@ -72,12 +75,47 @@ class WifiConfigCharacteristic extends bleno.Characteristic {
     }
   }
 }
+class DeviceInfoCharacteristic extends bleno.Characteristic {
+  constructor() {
+    super({
+      uuid: DEVICE_INFO_CHAR_UUID,
+      properties: ['read'],
+      descriptors: [
+        new bleno.Descriptor({
+          uuid: '2901',
+          value: 'Device Information: JSON with serial, mac, name, etc.'
+        })
+      ]
+    });
+  }
+
+  onReadRequest(offset, callback) {
+    try {
+      const deviceInfo = {
+        serialNumber: DEVICE_SERIAL,
+        macAddress: DEVICE_MAC,
+        deviceName: DEVICE_NAME,
+        firmwareVersion: '1.0.0',
+        timestamp: new Date().toISOString()
+      };
+      
+      const jsonString = JSON.stringify(deviceInfo);
+      const data = Buffer.from(jsonString, 'utf8');
+      
+      callback(this.RESULT_SUCCESS, data);
+    } catch (e) {
+      console.error('Read handling error', e);
+      callback(this.RESULT_UNLIKELY_ERROR);
+    }
+  }
+}
 
 const wifiChar = new WifiConfigCharacteristic();
+const deviceInfoChar = new DeviceInfoCharacteristic();
 
 const primaryService = new bleno.PrimaryService({
   uuid: SERVICE_UUID,
-  characteristics: [wifiChar]
+  characteristics: [wifiChar,deviceInfoChar]
 });
 
 bleno.on('stateChange', (state) => {
