@@ -1,3 +1,4 @@
+#!/bin/bash
 set -e
 
 echo "---Setting up Smart Wardrobe Access Point..."
@@ -11,11 +12,11 @@ fi
 # Install required packages
 echo "---Installing required packages..."
 apt update
-apt install -y hostapd dnsmasq iptables-persistent
+apt install -y hostapd dnsmasq iptables-persistent netfilter-persistent
 
-# Stop services
+# Stop services before configuration
 echo "---Stopping services..."
-systemctl stop hostapd dnsmasq
+systemctl stop hostapd dnsmasq || true
 
 # Configure hostapd WiFi AP
 echo "---Configuring WiFi Access Point..."
@@ -36,13 +37,14 @@ wpa_pairwise=TKIP
 rsn_pairwise=CCMP
 EOF
 
-# Point hostapd to config
+# Point hostapd to config (replace if already exists)
+sed -i '/^DAEMON_CONF/d' /etc/default/hostapd
 echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' >> /etc/default/hostapd
 
 # Configure dnsmasq DHCP server
 echo "---Configuring DHCP server..."
 # Backup original config
-cp /etc/dnsmasq.conf /etc/dnsmasq.conf.orig
+[ -f /etc/dnsmasq.conf ] && cp /etc/dnsmasq.conf /etc/dnsmasq.conf.orig
 
 cat > /etc/dnsmasq.conf << 'EOF'
 interface=wlan0
@@ -64,16 +66,21 @@ EOF
 
 # Enable IP forwarding
 echo "---Enabling IP forwarding..."
-echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+sysctl -p
 
 # Configure iptables for NAT internet sharing
 echo "---Configuring firewall rules..."
+iptables -F
+iptables -t nat -F
+
 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 iptables -A FORWARD -i eth0 -o wlan0 -m state --state RELATED,ESTABLISHED -j ACCEPT
 iptables -A FORWARD -i wlan0 -o eth0 -j ACCEPT
 
-# Save iptables rules
-iptables-save > /etc/iptables/rules.v4
+# Save iptables rules permanently
+netfilter-persistent save
+systemctl enable netfilter-persistent
 
 # Create systemd service for setup server
 echo "---Creating setup server service..."
@@ -86,7 +93,7 @@ Wants=hostapd.service dnsmasq.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/m3b/smartwardrobe/setup-server
+WorkingDirectory=/home/m3b/smartwardrobe/setup-server
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=5
@@ -98,11 +105,11 @@ EOF
 
 # Create setup server directory
 echo "---Creating setup server directory..."
-mkdir -p /m3b/smartwardrobe/setup-server
-chown m3b:m3b /m3b/smartwardrobe/setup-server
+mkdir -p /home/m3b/smartwardrobe/setup-server
+chown -R m3b:m3b /home/m3b/smartwardrobe
 
 # package.json for the setup server
-cat > /hm3b/smartwardrobe/setup-server/package.json << 'EOF'
+cat > /home/m3b/smartwardrobe/setup-server/package.json << 'EOF'
 {
   "name": "smartwardrobe-setup",
   "version": "1.0.0",
@@ -117,15 +124,16 @@ cat > /hm3b/smartwardrobe/setup-server/package.json << 'EOF'
 }
 EOF
 
-# installs Node.js dependencies
+# Install Node.js dependencies
 echo "---Installing Node.js dependencies..."
 cd /home/m3b/smartwardrobe/setup-server
 npm install
 
-echo "save the AP setup server as server.js in /m3b/smartwardrobe/setup-server/"
+echo ">>> Save the AP setup server as server.js in /home/m3b/smartwardrobe/setup-server/"
 
 # Create start/stop scripts
 cat > /home/m3b/start_setup_mode.sh << 'EOF'
+#!/bin/bash
 echo "---Starting Smart Wardrobe Setup Mode..."
 sudo nmcli device disconnect wlan0 2>/dev/null || true
 sudo systemctl start hostapd dnsmasq smartwardrobe-setup
@@ -135,10 +143,11 @@ echo "*** Connect to WiFi: SmartWardrobe-Setup"
 echo "**** Password: smartwardrobe123" 
 echo "***** Open browser to: http://192.168.4.1"
 echo ""
-echo "****** To stop setup mode: sudo bash /m3b/stop_setup_mode.sh"
+echo "****** To stop setup mode: sudo bash /home/m3b/stop_setup_mode.sh"
 EOF
 
-cat > /m3b/stop_setup_mode.sh << 'EOF'
+cat > /home/m3b/stop_setup_mode.sh << 'EOF'
+#!/bin/bash
 echo "** Stopping Smart Wardrobe Setup Mode..."
 sudo systemctl stop smartwardrobe-setup hostapd dnsmasq
 sudo systemctl restart dhcpcd
@@ -148,35 +157,48 @@ EOF
 
 chmod +x /home/m3b/start_setup_mode.sh /home/m3b/stop_setup_mode.sh
 
-# Enabling services
-echo "--- Enabling services..."
-systemctl enable hostapd dnsmasq smartwardrobe-setup
-
-#script to automatically enter setup mode if no WiFi config exists
+# Script to automatically enter setup mode if no WiFi config exists
 cat > /home/m3b/auto_setup_check.sh << 'EOF'
-# Check if device should enter setup mode on boot
+#!/bin/bash
 CONFIG_FILE="/etc/smartwardrobe/config.json"
 SETUP_MODE_FLAG="/tmp/smartwardrobe_setup_mode"
 if [ ! -f "$CONFIG_FILE" ] || [ -f "$SETUP_MODE_FLAG" ]; then
     echo "No configuration found or setup mode requested. Starting AP mode..."
-    /m3b/start_setup_mode.sh
+    /home/m3b/start_setup_mode.sh
 else
     echo "Configuration exists. Connecting to WiFi..."
-    # Ensure we're not in AP mode
-    /m3b/stop_setup_mode.sh 2>/dev/null || true
+    /home/m3b/stop_setup_mode.sh 2>/dev/null || true
 fi
 EOF
 
 chmod +x /home/m3b/auto_setup_check.sh
 
-# Add auto setup check to rc.local (runs on boot)
-sed -i '/exit 0/i\/m3b/auto_setup_check.sh' /etc/rc.local
+# Create systemd service for auto setup check
+echo "---Creating systemd auto-setup service..."
+cat > /etc/systemd/system/smartwardrobe-autosetup.service << 'EOF'
+[Unit]
+Description=Smart Wardrobe Auto Setup Check
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/m3b/auto_setup_check.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable smartwardrobe-autosetup
+
+# Enable services
+echo "---Enabling services..."
+systemctl enable hostapd dnsmasq smartwardrobe-setup
 
 echo ""
 echo "_*_*_* Smart Wardrobe Access Point setup complete!"
 echo ""
 echo "_*_*_*_*_* Next steps:"
-echo "1. Save the server.js code to /m3b/smartwardrobe/setup-server/server.js"
+echo "1. Save the server.js code to /home/m3b/smartwardrobe/setup-server/server.js"
 echo "2. Reboot the Pi: sudo reboot"
 echo "3. Pi will automatically start in setup mode if no WiFi is configured"
 echo "4. Connect to 'SmartWardrobe-Setup' WiFi (password: smartwardrobe123)"
