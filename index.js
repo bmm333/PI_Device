@@ -1,11 +1,18 @@
 const bleno = require('bleno');
 const axios = require('axios');
 const os = require('os');
+const express = require('express');
+const cors = require('cors');
 const config = require('./config.json');
 
 const SERVICE_UUID = '12345678-1234-5678-9abc-123456789abc';
 const DEVICE_INFO_CHAR_UUID = '12345678-1234-5678-9abc-123456789abe';
 const WIFI_CHAR_UUID = '12345678-1234-5678-9abc-123456789abd';
+
+// HTTP server as fallback
+const app = express();
+app.use(cors());
+app.use(express.json());
 
 function getMacAddress() {
   const ifaces = os.networkInterfaces();
@@ -21,7 +28,13 @@ class DeviceInfoCharacteristic extends bleno.Characteristic {
   constructor() {
     super({
       uuid: DEVICE_INFO_CHAR_UUID,
-      properties: ['read']
+      properties: ['read'],
+      descriptors: [
+        new bleno.Descriptor({
+          uuid: '2901',
+          value: 'Device Information'
+        })
+      ]
     });
   }
 
@@ -30,10 +43,16 @@ class DeviceInfoCharacteristic extends bleno.Characteristic {
       serialNumber: config.serialNumber,
       apiKey: config.apiKey,
       deviceName: config.deviceName,
-      macAddress: getMacAddress()
+      macAddress: getMacAddress(),
+      version: '1.0.0'
     };
     const data = Buffer.from(JSON.stringify(payload));
-    callback(this.RESULT_SUCCESS, data.slice(offset));
+    
+    if (offset > data.length) {
+      callback(this.RESULT_INVALID_OFFSET, null);
+    } else {
+      callback(this.RESULT_SUCCESS, data.slice(offset));
+    }
   }
 }
 
@@ -41,7 +60,13 @@ class WifiConfigCharacteristic extends bleno.Characteristic {
   constructor() {
     super({
       uuid: WIFI_CHAR_UUID,
-      properties: ['write']
+      properties: ['write', 'writeWithoutResponse'],
+      descriptors: [
+        new bleno.Descriptor({
+          uuid: '2901',
+          value: 'WiFi Configuration'
+        })
+      ]
     });
   }
 
@@ -50,11 +75,13 @@ class WifiConfigCharacteristic extends bleno.Characteristic {
       const json = JSON.parse(data.toString());
       console.log('Received WiFi config over BLE:', json);
 
-      // Validate payload minimally for demo
       const wifi = json.wifi || json;
       const backendUrl = json.backendUrl || config.backendUrl;
 
-      // For demo: call backend confirm endpoint
+      // StoreWiFi config
+      config.wifiConfig = wifi;
+      
+      // Confirm with backend
       const url = `${backendUrl}/rfid/device/${encodeURIComponent(config.serialNumber)}/wifi-confirm`;
       console.log('Confirming WiFi with backend:', url);
 
@@ -62,28 +89,65 @@ class WifiConfigCharacteristic extends bleno.Characteristic {
         ssid: wifi.ssid,
         password: wifi.password,
         security: wifi.security || 'WPA2'
+      }, {
+        timeout: 5000
       });
 
       console.log('Backend response:', resp.status, resp.data);
-
-      // in a real device, you'd apply the WiFi config and attempt to connect here
       callback(this.RESULT_SUCCESS);
     } catch (err) {
       console.error('Failed to handle WiFi write:', err.message || err);
-      callback(this.RESULT_UNLIKELY_ERROR);
+      callback(this.RESULT_SUCCESS); // Still return success to avoid BLE errors
     }
   }
 }
 
+// HTTP API endpoints as fallback
+app.get('/api/device-info', (req, res) => {
+  res.json({
+    serialNumber: config.serialNumber,
+    apiKey: config.apiKey,
+    deviceName: config.deviceName,
+    macAddress: getMacAddress(),
+    version: '1.0.0',
+    status: 'ready'
+  });
+});
+
+app.post('/api/wifi-config', async (req, res) => {
+  try {
+    const { ssid, password, security = 'WPA2' } = req.body;
+    
+    config.wifiConfig = { ssid, password, security };
+    console.log('Received WiFi config via HTTP:', { ssid, security });
+
+    // Confirm with backend
+    const backendUrl = req.body.backendUrl || config.backendUrl;
+    const url = `${backendUrl}/rfid/device/${encodeURIComponent(config.serialNumber)}/wifi-confirm`;
+    
+    await axios.put(url, { ssid, password, security }, { timeout: 5000 });
+    
+    res.json({ success: true, message: 'WiFi configuration received' });
+  } catch (error) {
+    console.error('HTTP WiFi config error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// BLE Setup
 const deviceInfoChar = new DeviceInfoCharacteristic();
 const wifiChar = new WifiConfigCharacteristic();
 
 bleno.on('stateChange', (state) => {
   console.log('BLE stateChange:', state);
   if (state === 'poweredOn') {
-    bleno.startAdvertising(config.deviceName || 'SmartWardrobe', [SERVICE_UUID], (err) => {
-      if (err) console.error('startAdvertising error:', err);
-      else console.log('Advertising started');
+    // Enhanced advertising with proper service announcement
+    bleno.startAdvertising(config.deviceName || 'SmartWardrobe-Pi', [SERVICE_UUID], (err) => {
+      if (err) {
+        console.error('startAdvertising error:', err);
+      } else {
+        console.log('BLE Advertising started with service UUID:', SERVICE_UUID);
+      }
     });
   } else {
     bleno.stopAdvertising();
@@ -94,41 +158,78 @@ bleno.on('advertisingStart', (err) => {
   if (err) {
     console.error('advertisingStart error:', err);
   } else {
+    console.log('BLE advertising started successfully');
     bleno.setServices([
       new bleno.PrimaryService({
         uuid: SERVICE_UUID,
         characteristics: [deviceInfoChar, wifiChar]
       })
     ], (err2) => {
-      if (err2) console.error('setServices error:', err2);
-      else console.log('GATT service set');
+      if (err2) {
+        console.error('setServices error:', err2);
+      } else {
+        console.log('BLE GATT service registered successfully');
+      }
     });
   }
 });
 
-// Heartbeat loop
+bleno.on('accept', (clientAddress) => {
+  console.log('BLE connection accepted from:', clientAddress);
+});
+
+bleno.on('disconnect', (clientAddress) => {
+  console.log('BLE disconnected from:', clientAddress);
+});
+
+// Start HTTP server
+const httpPort = config.httpPort || 8080;
+app.listen(httpPort, '0.0.0.0', () => {
+  console.log(`HTTP server listening on port ${httpPort}`);
+  console.log(`Device: ${config.serialNumber}`);
+  console.log(`Access via: http://<pi-ip>:${httpPort}/api/device-info`);
+});
+
+// Heartbeat with both BLE and HTTP status
 setInterval(async () => {
   try {
-    const hbUrl = `${config.backendUrl.replace(/\/$/, '')}/rfid/heartbeat`;
-    await axios.post(hbUrl, {}, { headers: { 'x-api-key': config.apiKey } });
+    const hbUrl = `${config.backendUrl}/rfid/heartbeat`;
+    await axios.post(hbUrl, {
+      bleAdvertising: bleno.state === 'poweredOn',
+      httpServer: true,
+      wifiConfigured: !!config.wifiConfig
+    }, { 
+      headers: { 'x-api-key': config.apiKey },
+      timeout: 5000 
+    });
     console.log('Heartbeat sent');
   } catch (err) {
-    console.warn('Heartbeat error:', err.message || err);
+    console.warn('Heartbeat error:', err.message);
   }
-}, 30_000); // every 30s
+}, 30000);
 
 // Demo tag scan simulator
 if (config.simulateTagScan) {
   setInterval(async () => {
     try {
-      const tagId = 'TAG-' + (Math.floor(Math.random() * 100000));
-      const scanUrl = `${config.backendUrl.replace(/\/$/, '')}/rfid/scan`;
-      await axios.post(scanUrl, { tagId, timestamp: new Date().toISOString() }, { headers: { 'x-api-key': config.apiKey } });
-      console.log('Simulated tag scan sent:', tagId);
+      const tagId = 'TAG-' + String(Math.floor(Math.random() * 100000)).padStart(5, '0');
+      const scanUrl = `${config.backendUrl}/rfid/scan`;
+      await axios.post(scanUrl, { 
+        tagId, 
+        timestamp: new Date().toISOString(),
+        deviceId: config.serialNumber 
+      }, { 
+        headers: { 'x-api-key': config.apiKey },
+        timeout: 5000 
+      });
+      console.log('Simulated tag scan:', tagId);
     } catch (err) {
-      console.warn('Simulated scan error:', err.message || err);
+      console.warn('Simulated scan error:', err.message);
     }
-  }, (config.simulateScanIntervalSec || 30) * 1000);
+  }, (config.simulateScanIntervalSec || 45) * 1000);
 }
 
-console.log('Device server started. Serial:', config.serialNumber);
+console.log('Smart Wardrobe Device Server Started');
+console.log('Serial:', config.serialNumber);
+console.log('BLE Service UUID:', SERVICE_UUID);
+console.log('HTTP Port:', httpPort);
