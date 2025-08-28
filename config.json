@@ -1,0 +1,8 @@
+{
+  "serialNumber": "0001",
+  "deviceName": "SmartWardrobePi-Demo",
+  "apiKey": "demo-device-api-key-abc123",
+  "backendUrl": "http://<HOST_OR_IP>:3002",
+  "simulateTagScan": true,
+  "simulateScanIntervalSec": 30
+}
