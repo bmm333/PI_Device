@@ -2,9 +2,9 @@ const bleno = require('@abandonware/bleno');
 const fs = require('fs');
 const { exec } = require('child_process');
 
-const SERVICE_UUID = '12345678123456789abc123456789abc'; // 128-bit, no hyphens
-const WIFI_CHAR_UUID = '12345678123456789abc123456789abd';
-const DEVICE_INFO_CHAR_UUID = '12345678123456789abc123456789abe';
+const SERVICE_UUID = '12345678-1234-5678-9abc-123456789abc';
+const WIFI_CHAR_UUID = '12345678-1234-5678-9abc-123456789abd';
+const DEVICE_INFO_CHAR_UUID = '12345678-1234-5678-9abc-123456789abe';
 
 const CONFIG_PATH = '/etc/smartwardrobe/config.json';
 const DEVICE_NAME = 'SmartWardrobe';
