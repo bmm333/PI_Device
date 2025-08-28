@@ -1,0 +1,12 @@
+{
+  "name": "smart-wardrobe-device",
+  "version": "0.1.0",
+  "main": "index.js",
+  "dependencies": {
+    "bleno": "^0.6.7",
+    "axios": "^1.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
