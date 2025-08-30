@@ -102,13 +102,13 @@ log "Updating package lists..."
 apt update || { error "apt update failed"; exit 1; }
 
 log "Installing system packages..."
-PACKAGES="hostapd dnsmasq iptables-persistent netfilter-persistent jq nodejs npm python3-pip libusb-1.0-0-dev libnfc-dev"
+PACKAGES="hostapd dnsmasq iptables-persistent netfilter-persistent jq nodejs npm python3-pip libusb-1.0-0-dev libnfc-dev pcscd pcsc-tools libccid"
 apt install -y $PACKAGES || { error "Package installation failed"; exit 1; }
 
 # Install Python packages for ACR122U
 if [ "$ACR122U_PRESENT" = true ]; then
     log "Installing Python NFC libraries..."
-    pip3 install nfcpy || warn "Failed to install nfcpy - RFID service may not work"
+    pip3 install --break-system-packages pyscard || warn "Failed to install pyscard - RFID service may not work"
 fi
 
 # =======================================
@@ -327,6 +327,9 @@ EOF
 
 chmod +x /usr/local/bin/smartwardrobe-*.sh
 
+# Create symlink for server.js compatibility
+ln -sf /usr/local/bin/smartwardrobe-connect-wifi.sh /usr/local/bin/smartwardrobe-connection-manager.sh
+
 # =======================================
 # Create systemd services
 # =======================================
@@ -375,8 +378,9 @@ if [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
 cat > /etc/systemd/system/smartwardrobe-rfid.service << EOF
 [Unit]
 Description=Smart Wardrobe RFID Service
-After=smartwardrobe-boot.service network-online.target
+After=smartwardrobe-boot.service network-online.target pcscd.service
 Wants=network-online.target
+Requires=pcscd.service
 
 [Service]
 ExecStart=/usr/bin/node $TARGET_DIR/rfid_service.js
@@ -399,7 +403,7 @@ fi
 log "Enabling services..."
 systemctl daemon-reload
 systemctl enable smartwardrobe-boot.service smartwardrobe-server.service
-systemctl enable hostapd.service dnsmasq.service
+systemctl enable hostapd.service dnsmasq.service pcscd.service
 
 if [ "$ACR122U_PRESENT" = true ] && [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
     systemctl enable smartwardrobe-rfid.service
@@ -424,6 +428,7 @@ fi
 # =======================================
 
 log "Starting services..."
+systemctl start pcscd.service
 systemctl start smartwardrobe-boot.service
 sleep 5
 systemctl start smartwardrobe-server.service
