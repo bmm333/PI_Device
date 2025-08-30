@@ -101,28 +101,47 @@ async function processTags(tags, apiKey) {
 function scanTags() {
   return new Promise((resolve, reject) => {
     const pythonProcess = spawn('python3', ['-c', `
-import nfc
 import sys
 import json
 import time
+from smartcard.System import readers
+from smartcard.util import toHexString
 
-def on_connect(tag):
-    tag_id = tag.identifier.hex().upper()
-    signal_strength = getattr(tag, 'signal_strength', 0)
-    print(json.dumps({'id': tag_id, 'signalStrength': signal_strength}))
-    return False  # Continue scanning
+def scan_cards():
+    try:
+        reader_list = readers()
+        if not reader_list:
+            return []
+        
+        cards = []
+        for reader in reader_list:
+            try:
+                connection = reader.createConnection()
+                connection.connect()
+                
+                # Get ATR (Answer To Reset) as card identifier
+                atr = connection.getATR()
+                card_id = ''.join(['%02X' % x for x in atr])
+                
+                cards.append({
+                    'id': card_id,
+                    'signalStrength': 100,
+                    'reader': str(reader)
+                })
+                
+                connection.disconnect()
+            except Exception as e:
+                # No card present or connection failed
+                continue
+        
+        return cards
+    except Exception as e:
+        raise Exception(f"PC/SC error: {str(e)}")
 
 try:
-    # Try multiple connection methods
-    for method in ['pcsc', 'usb']:
-        try:
-            with nfc.ContactlessFrontend(method) as clf:
-                clf.connect(rdwr={'on-connect': on_connect}, terminate=5.0)
-                break
-        except Exception as e:
-            if method == 'usb':  # Last attempt failed
-                raise e
-            continue
+    cards = scan_cards()
+    for card in cards:
+        print(json.dumps(card))
 except Exception as e:
     print(json.dumps({'error': str(e)}), file=sys.stderr)
     sys.exit(1)
@@ -141,12 +160,15 @@ except Exception as e:
 
     pythonProcess.on('close', (code) => {
       if (code !== 0) {
-        reject(new Error(`nfcpy error: ${errorOutput}`));
+        reject(new Error(`PC/SC error: ${errorOutput}`));
         return;
       }
 
       try {
-        const tags = output.trim().split('\n').map(line => JSON.parse(line)).filter(tag => !tag.error);
+        const tags = output.trim().split('\n')
+          .filter(line => line.trim())
+          .map(line => JSON.parse(line))
+          .filter(tag => !tag.error);
         resolve(tags);
       } catch (parseError) {
         reject(new Error(`Parse error: ${parseError.message}, output: ${output}`));
