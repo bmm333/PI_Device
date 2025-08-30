@@ -194,7 +194,7 @@ const server = http.createServer((req, res) => {
         
         // Switch to WiFi mode
         setTimeout(() => {
-          exec('/usr/local/bin/smartwardrobe-connection-manager.sh', (error) => {
+            exec('/usr/local/bin/smartwardrobe-connect-wifi.sh', (error) => {
             if (error) {
               log('ERROR', `WiFi switch failed: ${error.message}`);
             }
