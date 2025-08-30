@@ -102,14 +102,25 @@ log "Updating package lists..."
 apt update || { error "apt update failed"; exit 1; }
 
 log "Installing system packages..."
-PACKAGES="hostapd dnsmasq iptables-persistent netfilter-persistent jq nodejs npm python3-pip libusb-1.0-0-dev libnfc-dev pcscd pcsc-tools libccid"
+PACKAGES="hostapd dnsmasq iptables-persistent netfilter-persistent jq nodejs npm python3-pip libusb-1.0-0-dev libnfc-dev pcscd pcsc-tools libccid python3-setuptools python3-dev"
 apt install -y $PACKAGES || { error "Package installation failed"; exit 1; }
 
-# Install Python packages for ACR122U
-if [ "$ACR122U_PRESENT" = true ]; then
-    log "Installing Python NFC libraries..."
-    pip3 install --break-system-packages pyscard || warn "Failed to install pyscard - RFID service may not work"
-fi
+# Install Python packages for ACR122U with better error handling
+log "Installing Python NFC libraries..."
+pip3 install --break-system-packages pyscard || {
+    warn "Failed to install pyscard with --break-system-packages, trying alternative method..."
+    # Try installing without --break-system-packages for older systems
+    pip3 install pyscard || {
+        error "Failed to install pyscard - RFID service will not work"
+        ACR122U_PRESENT=false
+    }
+}
+
+# Verify pyscard installation
+python3 -c "import smartcard; print('pyscard installed successfully')" 2>/dev/null || {
+    warn "pyscard verification failed - RFID service may not work"
+    ACR122U_PRESENT=false
+}
 
 # =======================================
 # Stop conflicting services
@@ -189,6 +200,10 @@ log "Copied server.js from $SCRIPT_DIR"
 if [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
     cp "$SCRIPT_DIR/rfid_service.js" "$TARGET_DIR/"
     log "Copied rfid_service.js"
+    RFID_SERVICE_PRESENT=true
+else
+    warn "rfid_service.js not found in $SCRIPT_DIR"
+    RFID_SERVICE_PRESENT=false
 fi
 
 # No npm dependencies needed - server.js uses only built-in Node.js modules
@@ -197,6 +212,32 @@ log "Server uses built-in Node.js modules - no additional packages needed"
 # Set permissions
 chmod +x "$TARGET_DIR"/*.js 2>/dev/null || true
 chown -R root:root "$TARGET_DIR"
+
+# =======================================
+# Configure PC/SC service for ACR122U
+# =======================================
+
+if [ "$ACR122U_PRESENT" = true ]; then
+    log "Configuring PC/SC service for ACR122U..."
+    
+    # Ensure PC/SC service is enabled and started
+    systemctl enable pcscd
+    systemctl start pcscd || {
+        warn "Failed to start pcscd service"
+        ACR122U_PRESENT=false
+    }
+    
+    # Wait for PC/SC to initialize
+    sleep 3
+    
+    # Test if ACR122U is accessible
+    if timeout 10 pcsc_scan -n 2>/dev/null | grep -q "Reader"; then
+        log "ACR122U is accessible via PC/SC"
+    else
+        warn "ACR122U not accessible via PC/SC - RFID service may fail"
+        ACR122U_PRESENT=false
+    fi
+fi
 
 # =======================================
 # Create system scripts
@@ -373,8 +414,54 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-# RFID service (if rfid_service.js exists)
-if [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
+# Create ACR122U device detection script
+cat > /usr/local/bin/wait-for-acr122u.sh << 'EOF'
+#!/bin/bash
+LOG_FILE="/var/log/smartwardrobe/rfid.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+log "Waiting for ACR122U device to be ready..."
+
+# Wait up to 60 seconds for ACR122U to appear and be accessible
+for i in {1..60}; do
+    # Check if USB device is present
+    if lsusb | grep -qi "072f:2200\|Advanced Card Systems"; then
+        log "ACR122U USB device detected"
+        
+        # Wait a bit more for the device to initialize
+        sleep 2
+        
+        # Check if PC/SC can see it
+        if systemctl is-active pcscd >/dev/null 2>&1; then
+            if timeout 10 pcsc_scan -n 2>/dev/null | grep -q "Reader"; then
+                log "ACR122U is ready and accessible via PC/SC"
+                exit 0
+            else
+                log "ACR122U detected but not accessible via PC/SC (attempt $i/60)"
+            fi
+        else
+            log "PC/SC service not running, starting it..."
+            systemctl start pcscd || true
+            sleep 2
+        fi
+    else
+        log "ACR122U not detected via USB (attempt $i/60)"
+    fi
+    
+    sleep 1
+done
+
+log "ERROR: ACR122U not ready after 60 seconds"
+exit 1
+EOF
+
+chmod +x /usr/local/bin/wait-for-acr122u.sh
+
+# RFID service (create it regardless, but with device detection)
+if [ "$RFID_SERVICE_PRESENT" = true ]; then
 cat > /etc/systemd/system/smartwardrobe-rfid.service << EOF
 [Unit]
 Description=Smart Wardrobe RFID Service
@@ -383,18 +470,60 @@ Wants=network-online.target
 Requires=pcscd.service
 
 [Service]
+# Wait for ACR122U to be ready before starting
+ExecStartPre=/usr/local/bin/wait-for-acr122u.sh
 ExecStart=/usr/bin/node $TARGET_DIR/rfid_service.js
 WorkingDirectory=$TARGET_DIR
 StandardOutput=append:$LOG_DIR/rfid.log
 StandardError=append:$LOG_DIR/rfid.log
 User=root
 Restart=always
-RestartSec=10
+RestartSec=20
+StartLimitBurst=3
+StartLimitIntervalSec=600
 
 [Install]
 WantedBy=multi-user.target
 EOF
+    ENABLE_RFID_SERVICE=true
+    log "RFID service configured with ACR122U hotplug detection"
+else
+    ENABLE_RFID_SERVICE=false
+    log "RFID service disabled - rfid_service.js not found"
 fi
+
+# =======================================
+# Add udev rules for ACR122U
+# =======================================
+
+# Add udev rules for ACR122U hotplug
+log "Adding ACR122U udev rules for hotplug support..."
+cat > /etc/udev/rules.d/99-acr122u.rules << 'EOF'
+# ACR122U NFC Reader rules
+SUBSYSTEM=="usb", ATTRS{idVendor}=="072f", ATTRS{idProduct}=="2200", MODE="0666", GROUP="plugdev", TAG+="systemd", ENV{SYSTEMD_WANTS}="smartwardrobe-rfid-hotplug.service"
+
+# Alternative vendor IDs for ACR122U variants
+SUBSYSTEM=="usb", ATTRS{idVendor}=="072f", ATTRS{idProduct}=="2200", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="072f", ATTRS{idProduct}=="90cc", MODE="0666", GROUP="plugdev"
+EOF
+
+# Create hotplug service that triggers when ACR122U is connected
+cat > /etc/systemd/system/smartwardrobe-rfid-hotplug.service << 'EOF'
+[Unit]
+Description=Smart Wardrobe RFID Hotplug Handler
+After=pcscd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'sleep 3; systemctl restart smartwardrobe-rfid.service || true'
+RemainAfterExit=no
+EOF
+
+udevadm control --reload-rules
+udevadm trigger
+
+# Add user to plugdev group
+usermod -a -G plugdev root 2>/dev/null || true
 
 # =======================================
 # Enable services
@@ -405,22 +534,10 @@ systemctl daemon-reload
 systemctl enable smartwardrobe-boot.service smartwardrobe-server.service
 systemctl enable hostapd.service dnsmasq.service pcscd.service
 
-if [ "$ACR122U_PRESENT" = true ] && [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
+if [ "$ENABLE_RFID_SERVICE" = true ]; then
     systemctl enable smartwardrobe-rfid.service
-    log "RFID service enabled"
-fi
-
-# =======================================
-# Add udev rules for ACR122U
-# =======================================
-
-if [ "$ACR122U_PRESENT" = true ]; then
-    log "Adding ACR122U udev rules..."
-    cat > /etc/udev/rules.d/99-acr122u.rules << 'EOF'
-SUBSYSTEM=="usb", ATTRS{idVendor}=="072f", ATTRS{idProduct}=="2200", MODE="0666", GROUP="plugdev"
-EOF
-    udevadm control --reload-rules
-    udevadm trigger
+    systemctl enable smartwardrobe-rfid-hotplug.service
+    log "RFID service and hotplug handler enabled"
 fi
 
 # =======================================
@@ -429,11 +546,13 @@ fi
 
 log "Starting services..."
 systemctl start pcscd.service
+sleep 2
 systemctl start smartwardrobe-boot.service
 sleep 5
 systemctl start smartwardrobe-server.service
 
-if [ "$ACR122U_PRESENT" = true ] && [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
+if [ "$ENABLE_RFID_SERVICE" = true ]; then
+    sleep 3
     systemctl start smartwardrobe-rfid.service
 fi
 
@@ -456,11 +575,12 @@ else
     systemctl status smartwardrobe-server.service
 fi
 
-if [ "$ACR122U_PRESENT" = true ] && [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
+if [ "$ENABLE_RFID_SERVICE" = true ]; then
     if systemctl is-active smartwardrobe-rfid.service >/dev/null; then
         log "RFID service is running"
     else
-        warn "RFID service not running - check logs"
+        warn "RFID service not running - check logs with: sudo journalctl -u smartwardrobe-rfid.service -f"
+        systemctl status smartwardrobe-rfid.service || true
     fi
 fi
 
@@ -485,14 +605,17 @@ echo "2. Open browser and go to http://192.168.4.1"
 echo "3. Enter your home WiFi credentials and API key"
 echo "4. Device will automatically switch to your home WiFi"
 echo
-if [ "$ACR122U_PRESENT" = true ]; then
-    echo "RFID Service: Ready to scan tags and send to backend"
+if [ "$ENABLE_RFID_SERVICE" = true ]; then
+    echo "RFID Service: Ready - supports hotplug (plug ACR122U anytime)"
+    echo "Debug RFID: sudo journalctl -u smartwardrobe-rfid.service -f"
+    echo "Manual restart: sudo systemctl restart smartwardrobe-rfid.service"
 else
-    echo "RFID Service: Connect ACR122U and restart to enable"
+    echo "RFID Service: Disabled (rfid_service.js not found)"
 fi
 echo
 echo "Logs: /var/log/smartwardrobe/"
 echo "Config: /etc/smartwardrobe/config.json"
+echo "Debug server: sudo journalctl -u smartwardrobe-server.service -f"
 echo
 echo "Rebooting in 10 seconds..."
 sleep 10
