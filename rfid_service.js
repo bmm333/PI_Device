@@ -166,10 +166,6 @@ def get_card_uuid(connection):
                 return uuid
     except Exception as e:
         pass
-    
-    # If all UID methods fail, fall back to ATR (but this means UID reading failed)
-    atr = connection.getATR()
-    return 'ATR_' + ''.join(['%02X' % x for x in atr])
 
 def scan_cards():
     try:
