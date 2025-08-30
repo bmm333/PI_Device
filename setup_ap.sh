@@ -1,27 +1,76 @@
 #!/bin/bash
 set -e
 
-echo "---Setting up Smart Wardrobe Access Point..."
+# =======================================
+# Smart Wardrobe Setup - Fixed Version
+# =======================================
 
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then 
-    echo "❌ Please run as root (sudo)"
+# Ensure root
+if [ "$EUID" -ne 0 ]; then
+    echo "This script must be run as root." >&2
     exit 1
 fi
 
+# Define file locations
+SOURCE_DIR="/home/web/smartwardrobe"
+SERVER_PATH="${SOURCE_DIR}/setup-server/server.js"
+TARGET_DIR="/opt/smartwardrobe"
+LOG_DIR="/var/log/smartwardrobe"
+CONFIG_DIR="/etc/smartwardrobe"
+
+# Logging setup
+mkdir -p "$LOG_DIR"
+LOGFILE="$LOG_DIR/bootstrap.log"
+log() {
+    echo "$(date): $1" | tee -a "$LOGFILE"
+}
+
+log "Starting Smart Wardrobe setup process..."
+
+# ---------------------------
+# Check internet connectivity
+# ---------------------------
+log "Checking internet connectivity..."
+if ! ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1; then
+    log "Error: No internet connection. Connect to WiFi first or check Ethernet."
+    exit 1
+fi
+
+# ---------------------------
 # Install required packages
-echo "---Installing required packages..."
-apt update
-apt install -y hostapd dnsmasq iptables-persistent netfilter-persistent jq
+# ---------------------------
+log "Installing required packages..."
+apt update || { log "Error: apt update failed"; exit 1; }
+apt install -y hostapd dnsmasq iptables-persistent netfilter-persistent jq nodejs npm || { log "Error: Package installation failed"; exit 1; }
 
-# Stop services before configuration
-echo "---Stopping services..."
-systemctl stop hostapd dnsmasq || true
+# ---------------------------
+# Detect WiFi interface and validate
+# ---------------------------
+WIFI_IFACE=$(iw dev | awk '$1=="Interface"{print $2}' | head -1)
+if [ -z "$WIFI_IFACE" ]; then
+    log "Error: No WiFi interface detected. Ensure WiFi is enabled."
+    exit 1
+fi
+log "Using WiFi interface: $WIFI_IFACE"
 
-# Configure hostapd WiFi AP
-echo "---Configuring WiFi Access Point..."
-cat > /etc/hostapd/hostapd.conf << 'EOF'
-interface=wlan0
+# ---------------------------
+# Stop and disable conflicting services properly
+# ---------------------------
+log "Stopping and disabling conflicting services..."
+systemctl stop wpa_supplicant dhcpcd hostapd dnsmasq NetworkManager 2>/dev/null || true
+systemctl disable wpa_supplicant dhcpcd 2>/dev/null || true
+
+# Kill any lingering processes
+pkill -f wpa_supplicant || true
+pkill -f dhclient || true
+
+# ---------------------------
+# Configure hostapd with detected interface
+# ---------------------------
+log "Setting up access point..."
+mkdir -p /etc/hostapd
+cat > /etc/hostapd/hostapd.conf << EOF
+interface=$WIFI_IFACE
 driver=nl80211
 ssid=SmartWardrobe-Setup
 hw_mode=g
@@ -37,395 +86,334 @@ wpa_pairwise=TKIP
 rsn_pairwise=CCMP
 EOF
 
-# Point hostapd to config (replace if already exists)
-sed -i '/^DAEMON_CONF/d' /etc/default/hostapd
-echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' >> /etc/default/hostapd
+echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' > /etc/default/hostapd
 
-# Configure dnsmasq DHCP server
-echo "---Configuring DHCP server..."
-# Backup original config
-[ -f /etc/dnsmasq.conf ] && cp /etc/dnsmasq.conf /etc/dnsmasq.conf.orig
-
-cat > /etc/dnsmasq.conf << 'EOF'
-interface=wlan0
+# ---------------------------
+# Configure dnsmasq with detected interface
+# ---------------------------
+log "Configuring DHCP server..."
+mv /etc/dnsmasq.conf /etc/dnsmasq.conf.orig 2>/dev/null || true
+cat > /etc/dnsmasq.conf << EOF
+interface=$WIFI_IFACE
 dhcp-range=192.168.4.2,192.168.4.20,255.255.255.0,24h
-
-# Captive portal - redirect all HTTP requests to our setup server
 address=/#/192.168.4.1
 EOF
 
-# Configure network interfaces
-echo "---Configuring network interfaces..."
-cat >> /etc/dhcpcd.conf << 'EOF'
+# ---------------------------
+# Enable forwarding & firewall
+# ---------------------------
+log "Configuring network settings..."
+echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-smartwardrobe.conf
+sysctl -p /etc/sysctl.d/99-smartwardrobe.conf
 
-# Static IP for AP mode
-interface wlan0
-static ip_address=192.168.4.1/24
-nohook wpa_supplicant
-EOF
-
-# Enable IP forwarding
-echo "---Enabling IP forwarding..."
-grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-sysctl -p
-
-# Configure iptables for NAT internet sharing
-echo "---Configuring firewall rules..."
+# Clear existing rules
 iptables -F
 iptables -t nat -F
 
+# Setup NAT and forwarding
 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-iptables -A FORWARD -i eth0 -o wlan0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -A FORWARD -i wlan0 -o eth0 -j ACCEPT
+iptables -A FORWARD -i "$WIFI_IFACE" -o eth0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i eth0 -o "$WIFI_IFACE" -j ACCEPT
 
-# Save iptables rules permanently
-netfilter-persistent save
+# Save rules
+iptables-save > /etc/iptables/rules.v4
 systemctl enable netfilter-persistent
 
-# Create systemd service for setup server
-echo "---Creating setup server service..."
-cat > /etc/systemd/system/smartwardrobe-setup.service << 'EOF'
+# Create directories
+mkdir -p "${CONFIG_DIR}"
+mkdir -p "${LOG_DIR}"
+mkdir -p "${TARGET_DIR}"
+
+# ---------------------------
+# Fixed AP Script - Single interface management
+# ---------------------------
+log "Creating system scripts..."
+cat > /usr/local/bin/smartwardrobe-force-ap.sh << 'EOF'
+#!/bin/bash
+LOGFILE=/var/log/smartwardrobe/system.log
+WIFI_IFACE=$(iw dev | awk '$1=="Interface"{print $2}' | head -1)
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOGFILE"
+    echo "$1"
+}
+
+if [ -z "$WIFI_IFACE" ]; then
+    log "ERROR: No WiFi interface found"
+    exit 1
+fi
+
+log "Starting AP mode on interface: $WIFI_IFACE"
+
+# Stop NetworkManager completely
+log "Stopping NetworkManager"
+systemctl stop NetworkManager.service || true
+sleep 3
+
+# Kill interfering processes
+log "Killing interfering processes"
+pkill -f wpa_supplicant || true
+pkill -f dhclient || true
+pkill -f NetworkManager || true
+
+# Stop services
+systemctl stop hostapd.service dnsmasq.service || true
+sleep 2
+
+# Configure interface manually
+log "Configuring interface $WIFI_IFACE"
+ip link set "$WIFI_IFACE" down
+ip addr flush dev "$WIFI_IFACE"
+ip link set "$WIFI_IFACE" up
+ip addr add 192.168.4.1/24 dev "$WIFI_IFACE"
+
+# Wait for interface to be ready
+sleep 3
+
+# Start AP services
+log "Starting AP services"
+systemctl start hostapd.service
+sleep 2
+systemctl start dnsmasq.service
+
+# Verify services are running
+if systemctl is-active hostapd.service >/dev/null && systemctl is-active dnsmasq.service >/dev/null; then
+    log "AP mode active - SSID: SmartWardrobe-Setup"
+    # Create status file
+    echo "ap" > /tmp/smartwardrobe-mode
+else
+    log "ERROR: AP services failed to start"
+    systemctl status hostapd.service >> "$LOGFILE"
+    systemctl status dnsmasq.service >> "$LOGFILE"
+    exit 1
+fi
+EOF
+
+chmod +x /usr/local/bin/smartwardrobe-force-ap.sh
+
+# ---------------------------
+# Fixed Connection Manager Script
+# ---------------------------
+cat > /usr/local/bin/smartwardrobe-connection-manager.sh << 'EOF'
+#!/bin/bash
+CONFIG_FILE="/etc/smartwardrobe/config.json"
+LOGFILE="/var/log/smartwardrobe/system.log"
+WIFI_IFACE=$(iw dev | awk '$1=="Interface"{print $2}' | head -1)
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOGFILE"
+    echo "$1"
+}
+
+check_internet() {
+    ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1
+    return $?
+}
+
+if [ -z "$WIFI_IFACE" ]; then
+    log "ERROR: No WiFi interface found"
+    exit 1
+fi
+
+log "Starting connection manager for interface: $WIFI_IFACE"
+
+# Check if config exists
+if [ ! -f "$CONFIG_FILE" ]; then
+    log "No WiFi config found. Switching to AP mode"
+    /usr/local/bin/smartwardrobe-force-ap.sh
+    exit 0
+fi
+
+# Read configuration
+SSID=$(jq -r '.ssid // empty' "$CONFIG_FILE" 2>/dev/null)
+PASSWORD=$(jq -r '.password // empty' "$CONFIG_FILE" 2>/dev/null)
+
+if [ -z "$SSID" ] || [ -z "$PASSWORD" ]; then
+    log "WiFi config invalid. Switching to AP mode"
+    /usr/local/bin/smartwardrobe-force-ap.sh
+    exit 0
+fi
+
+log "Attempting to connect to WiFi: $SSID"
+
+# Stop AP services completely
+log "Stopping AP services"
+systemctl stop hostapd.service dnsmasq.service || true
+pkill -f hostapd || true
+pkill -f dnsmasq || true
+
+# Clean up interface
+log "Cleaning up interface $WIFI_IFACE"
+ip addr flush dev "$WIFI_IFACE" || true
+ip link set "$WIFI_IFACE" down || true
+sleep 2
+ip link set "$WIFI_IFACE" up || true
+
+# Start NetworkManager and configure
+log "Starting NetworkManager"
+systemctl start NetworkManager.service
+sleep 5
+
+# Ensure interface is managed
+nmcli device set "$WIFI_IFACE" managed yes
+nmcli radio wifi on
+sleep 3
+
+# Create connection
+CONNECTION_NAME="SmartWardrobe-WiFi"
+log "Creating WiFi connection: $CONNECTION_NAME"
+
+# Remove existing connection
+nmcli con delete "$CONNECTION_NAME" 2>/dev/null || true
+
+# Add new connection
+if ! nmcli con add type wifi con-name "$CONNECTION_NAME" ssid "$SSID"; then
+    log "Failed to create connection profile"
+    /usr/local/bin/smartwardrobe-force-ap.sh
+    exit 1
+fi
+
+# Configure security
+if ! nmcli con modify "$CONNECTION_NAME" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$PASSWORD"; then
+    log "Failed to set WiFi security"
+    nmcli con delete "$CONNECTION_NAME" 2>/dev/null || true
+    /usr/local/bin/smartwardrobe-force-ap.sh
+    exit 1
+fi
+
+# Set to autoconnect
+nmcli con modify "$CONNECTION_NAME" autoconnect yes
+
+# Connect with timeout
+log "Connecting to $SSID..."
+if timeout 60 nmcli con up "$CONNECTION_NAME"; then
+    log "WiFi connection established"
+    sleep 10
+    
+    if check_internet; then
+        NEW_IP=$(ip route get 1.1.1.1 | awk '{print $7; exit}' 2>/dev/null)
+        log "Successfully connected to $SSID with internet access. IP: $NEW_IP"
+        echo "client" > /tmp/smartwardrobe-mode
+        echo "$(date)" > "/etc/smartwardrobe/wifi-connected"
+        exit 0
+    else
+        log "Connected but no internet access"
+    fi
+else
+    log "Failed to connect to WiFi network"
+fi
+
+# Cleanup failed connection
+nmcli con delete "$CONNECTION_NAME" 2>/dev/null || true
+log "Falling back to AP mode"
+/usr/local/bin/smartwardrobe-force-ap.sh
+exit 1
+EOF
+
+chmod +x /usr/local/bin/smartwardrobe-connection-manager.sh
+
+# ---------------------------
+# Simplified systemd services with proper dependencies
+# ---------------------------
+log "Creating system services..."
+
+# Boot manager service
+cat > /etc/systemd/system/smartwardrobe-boot.service << 'EOF'
 [Unit]
-Description=Smart Wardrobe AP Setup Server
-After=network.target
-Wants=hostapd.service dnsmasq.service
+Description=Smart Wardrobe Boot Manager
+After=multi-user.target
+DefaultDependencies=no
 
 [Service]
-Type=simple
+Type=oneshot
+ExecStart=/bin/bash -c 'if [ -f "/etc/smartwardrobe/config.json" ]; then /usr/local/bin/smartwardrobe-connection-manager.sh; else /usr/local/bin/smartwardrobe-force-ap.sh; fi'
+RemainAfterExit=yes
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ---------------------------
+# Setup server.js and install dependencies
+# ---------------------------
+log "Setting up server application..."
+if [ -f "${SERVER_PATH}" ]; then
+    cp -f "${SERVER_PATH}" "${TARGET_DIR}/server.js"
+    log "Copied server.js from ${SERVER_PATH}"
+else
+    log "Server file not found, using embedded version"
+    
+fi
+
+# Install npm dependencies
+log "Installing npm packages..."
+cd "${TARGET_DIR}"
+npm init -y >/dev/null 2>&1 || true
+npm install --no-fund express >/dev/null 2>&1 || log "Warning: npm install failed"
+
+# ---------------------------
+# Web server service
+# ---------------------------
+cat > /etc/systemd/system/smartwardrobe-server.service << EOF
+[Unit]
+Description=Smart Wardrobe Setup Web Server
+After=smartwardrobe-boot.service
+Requires=smartwardrobe-boot.service
+ConditionPathExists=${TARGET_DIR}/server.js
+
+[Service]
+ExecStart=/usr/bin/node ${TARGET_DIR}/server.js
+WorkingDirectory=${TARGET_DIR}
+StandardOutput=append:${LOG_DIR}/server.log
+StandardError=append:${LOG_DIR}/server.log
 User=root
-WorkingDirectory=/home/m3b/smartwardrobe/setup-server
-ExecStart=/usr/bin/node server.js
 Restart=always
-RestartSec=5
+RestartSec=10
 Environment=NODE_ENV=production
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Create setup server directory
-echo "---Creating setup server directory..."
-mkdir -p /home/m3b/smartwardrobe/setup-server
-chown -R m3b:m3b /home/m3b/smartwardrobe
+# ---------------------------
+# Enable services and final setup
+# ---------------------------
+log "Enabling services..."
+systemctl daemon-reload
+systemctl enable smartwardrobe-boot.service smartwardrobe-server.service
+systemctl enable hostapd.service dnsmasq.service
 
-# package.json for the setup server
-cat > /home/m3b/smartwardrobe/setup-server/package.json << 'EOF'
-{
-  "name": "smartwardrobe-setup",
-  "version": "1.0.0",
-  "description": "Smart Wardrobe AP Setup Server",
-  "main": "server.js",
-  "dependencies": {
-    "express": "^4.18.0"
-  },
-  "scripts": {
-    "start": "node server.js"
-  }
-}
-EOF
+# Set permissions
+chmod 755 "${TARGET_DIR}/server.js" 2>/dev/null || true
 
-# Install Node.js dependencies
-echo "---Installing Node.js dependencies..."
-cd /home/m3b/smartwardrobe/setup-server
-npm install
+# Start initial services
+log "Starting services..."
+systemctl start smartwardrobe-boot.service
+sleep 5
+systemctl start smartwardrobe-server.service
 
-echo ">>> Save the AP setup server as server.js in /home/m3b/smartwardrobe/setup-server/"
-
-# Create start/stop scripts
-cat > /home/m3b/start_setup_mode.sh << 'EOF'
-#!/bin/bash
-echo "---Starting Smart Wardrobe Setup Mode..."
-sudo nmcli device disconnect wlan0 2>/dev/null || true
-
-# Remove existing WiFi connections that might interfere
-for con in $(nmcli -t -f NAME,TYPE con show 2>/dev/null | grep wifi | cut -d: -f1); do
-    echo "Removing old WiFi connection: $con"
-    sudo nmcli con delete "$con" 2>/dev/null || true
-done
-
-sudo systemctl start hostapd dnsmasq smartwardrobe-setup
-
-echo "** Setup mode started!"
-echo "*** Connect to WiFi: SmartWardrobe-Setup"
-echo "**** Password: smartwardrobe123" 
-echo "***** Open browser to: http://192.168.4.1"
-echo ""
-echo "****** To stop setup mode: sudo bash /home/m3b/stop_setup_mode.sh"
-EOF
-
-cat > /home/m3b/stop_setup_mode.sh << 'EOF'
-#!/bin/bash
-echo "** Stopping Smart Wardrobe Setup Mode..."
-sudo systemctl stop smartwardrobe-setup hostapd dnsmasq
-sudo systemctl restart dhcpcd
-
-echo "*** Setup mode stopped. Device will try to reconnect to configured WiFi."
-EOF
-
-chmod +x /home/m3b/start_setup_mode.sh /home/m3b/stop_setup_mode.sh
-
-# Improved auto setup check with WiFi retry logic
-cat > /home/m3b/auto_setup_check.sh << 'EOF'
-#!/bin/bash
-
-CONFIG_FILE="/etc/smartwardrobe/config.json"
-SETUP_MODE_FLAG="/tmp/smartwardrobe_setup_mode"
-RETRY_COUNT_FILE="/tmp/smartwardrobe_wifi_retry"
-CONNECTION_LOG="/var/log/smartwardrobe.log"
-MAX_RETRIES=3
-
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$CONNECTION_LOG"
-}
-
-# Check if we have working internet connection
-check_internet() {
-    if ping -c 1 -W 10 8.8.8.8 >/dev/null 2>&1 || ping -c 1 -W 10 1.1.1.1 >/dev/null 2>&1; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Try to connect to configured WiFi
-try_wifi_connection() {
-    local config_file="$1"
-    
-    if [ ! -f "$config_file" ]; then
-        return 1
-    fi
-    
-    # Extract credentials
-    local ssid=$(jq -r '.ssid // empty' "$config_file" 2>/dev/null)
-    local password=$(jq -r '.password // empty' "$config_file" 2>/dev/null)
-    
-    if [ -z "$ssid" ] || [ -z "$password" ]; then
-        log "Invalid config: missing SSID or password"
-        return 1
-    fi
-    
-    log "Attempting to connect to: $ssid"
-    
-    # Try to connect
-    if nmcli dev wifi connect "$ssid" password "$password" 2>/dev/null; then
-        # Wait up to 30 seconds for connection
-        local waited=0
-        while [ $waited -lt 30 ]; do
-            if nmcli -t -f GENERAL.STATE dev show wlan0 2>/dev/null | grep -q "100 (connected)"; then
-                # Connected, check internet
-                sleep 5
-                if check_internet; then
-                    log "Successfully connected to $ssid with internet access"
-                    return 0
-                else
-                    log "Connected to $ssid but no internet access"
-                    return 1
-                fi
-            fi
-            sleep 2
-            waited=$((waited + 2))
-        done
-    fi
-    
-    log "Failed to connect to: $ssid"
-    return 1
-}
-
-# Get current retry count
-get_retry_count() {
-    if [ -f "$RETRY_COUNT_FILE" ]; then
-        cat "$RETRY_COUNT_FILE"
-    else
-        echo "0"
-    fi
-}
-
-# Increment retry count
-increment_retry_count() {
-    local count=$(get_retry_count)
-    count=$((count + 1))
-    echo "$count" > "$RETRY_COUNT_FILE"
-}
-
-# Reset retry count
-reset_retry_count() {
-    rm -f "$RETRY_COUNT_FILE"
-}
-
-# Main logic
-log "Smart Wardrobe startup check..."
-
-# Force setup mode
-if [ -f "$SETUP_MODE_FLAG" ]; then
-    log "Setup mode flag detected - starting AP mode"
-    /home/m3b/start_setup_mode.sh
-    exit 0
+# Final status check
+sleep 5
+if systemctl is-active smartwardrobe-server.service >/dev/null; then
+    log "Server is running successfully"
+else
+    log "Warning: Server may not have started properly"
+    systemctl status smartwardrobe-server.service >> "$LOGFILE"
 fi
 
-# No configuration file
-if [ ! -f "$CONFIG_FILE" ]; then
-    log "No configuration found - starting AP mode"
-    /home/m3b/start_setup_mode.sh
-    exit 0
-fi
+log "==============================================================="
+log "Smart Wardrobe setup complete!"
+log "Device starting in AP mode with SSID: SmartWardrobe-Setup"
+log "Password: smartwardrobe123"
+log ""
+log "To configure:"
+log "1. Connect to WiFi: SmartWardrobe-Setup"
+log "2. Visit: http://192.168.4.1"
+log ""
+log "Services will auto-start on reboot"
+log "==============================================================="
 
-# Configuration exists - try to connect
-if try_wifi_connection "$CONFIG_FILE"; then
-    log "WiFi connection successful"
-    reset_retry_count
-    # Make sure setup mode is stopped
-    /home/m3b/stop_setup_mode.sh 2>/dev/null || true
-    exit 0
-fi
-
-# Connection failed - check retry count
-retry_count=$(get_retry_count)
-log "WiFi connection failed (attempt $((retry_count + 1))/$MAX_RETRIES)"
-
-if [ "$retry_count" -ge "$((MAX_RETRIES - 1))" ]; then
-    log "Max retries reached - entering setup mode"
-    reset_retry_count
-    /home/m3b/start_setup_mode.sh
-    exit 0
-fi
-
-# Increment retry and schedule another attempt
-increment_retry_count
-log "Will retry WiFi connection in 30 seconds..."
-
-# Schedule retry (run in background)
-(
-    sleep 30
-    /home/m3b/auto_setup_check.sh
-) &
-
-exit 1
-EOF
-
-chmod +x /home/m3b/auto_setup_check.sh
-
-# Create systemd service for auto setup check
-echo "---Creating systemd auto-setup service..."
-cat > /etc/systemd/system/smartwardrobe-autosetup.service << 'EOF'
-[Unit]
-Description=Smart Wardrobe Auto Setup Check
-After=network.target dhcpcd.service
-Wants=network.target
-
-[Service]
-Type=forking
-ExecStart=/home/m3b/auto_setup_check.sh
-Restart=no
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Create a watchdog service for ongoing monitoring
-cat > /etc/systemd/system/smartwardrobe-watchdog.service << 'EOF'
-[Unit]
-Description=Smart Wardrobe Connection Watchdog
-After=smartwardrobe-autosetup.service
-
-[Service]
-Type=simple
-ExecStart=/home/m3b/wifi_watchdog.sh
-Restart=always
-RestartSec=60
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Create watchdog script
-cat > /home/m3b/wifi_watchdog.sh << 'EOF'
-#!/bin/bash
-
-CONNECTION_LOG="/var/log/smartwardrobe.log"
-
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WATCHDOG: $1" | tee -a "$CONNECTION_LOG"
-}
-
-check_internet() {
-    ping -c 1 -W 10 8.8.8.8 >/dev/null 2>&1
-}
-
-is_setup_mode_active() {
-    systemctl is-active --quiet hostapd
-}
-
-while true; do
-    sleep 300  # Check every 5 minutes
-    
-    if is_setup_mode_active; then
-        # Setup mode is active, don't interfere
-        continue
-    fi
-    
-    # Check if WiFi is connected and has internet
-    if nmcli -t -f GENERAL.STATE dev show wlan0 2>/dev/null | grep -q "100 (connected)"; then
-        if ! check_internet; then
-            log "WiFi connected but no internet - triggering reconnect"
-            /home/m3b/auto_setup_check.sh &
-        fi
-    else
-        log "WiFi not connected - triggering reconnect"
-        /home/m3b/auto_setup_check.sh &
-    fi
-done
-EOF
-
-chmod +x /home/m3b/wifi_watchdog.sh
-
-# Enable services
-echo "---Enabling services..."
-systemctl enable hostapd dnsmasq smartwardrobe-setup smartwardrobe-autosetup smartwardrobe-watchdog
-
-# Create manual control shortcuts
-cat > /home/m3b/force_setup.sh << 'EOF'
-#!/bin/bash
-echo "🔧 Forcing setup mode..."
-sudo touch /tmp/smartwardrobe_setup_mode
-sudo rm -f /tmp/smartwardrobe_wifi_retry
-sudo systemctl restart smartwardrobe-autosetup
-echo "✅ Setup mode will start shortly"
-EOF
-
-cat > /home/m3b/clear_config.sh << 'EOF'
-#!/bin/bash
-echo "🗑️ Clearing WiFi configuration..."
-sudo rm -f /etc/smartwardrobe/config.json
-sudo rm -f /tmp/smartwardrobe_wifi_retry
-sudo rm -f /tmp/smartwardrobe_setup_mode
-sudo systemctl restart smartwardrobe-autosetup
-echo "✅ Configuration cleared - will enter setup mode"
-EOF
-
-chmod +x /home/m3b/force_setup.sh /home/m3b/clear_config.sh
-
-echo ""
-echo "_*_*_* Smart Wardrobe Access Point setup complete!"
-echo ""
-echo "_*_*_*_*_* Features:"
-echo "✅ Automatic setup mode if no WiFi config"
-echo "✅ Retry WiFi connection 3 times before entering setup mode"  
-echo "✅ Continuous monitoring of WiFi health"
-echo "✅ Handles WiFi password changes, router reboots, etc."
-echo ""
-echo "_*_*_*_*_* Next steps:"
-echo "1. Save the server.js code to /home/m3b/smartwardrobe/setup-server/server.js"
-echo "2. Reboot the Pi: sudo reboot"
-echo "3. Pi will automatically manage WiFi connections"
-echo ""
-echo "_*_*_*_*_* Manual controls:"
-echo "   Force setup mode:     sudo ./force_setup.sh"
-echo "   Clear WiFi config:    sudo ./clear_config.sh"
-echo "   View logs:           tail -f /var/log/smartwardrobe.log"
-echo ""
-echo "_*_*_*_*_* How it works for users:"
-echo "📱 New device → Automatic setup mode"
-echo "🏠 Normal use → Connects to saved WiFi"
-echo "🔄 WiFi problems → Retries 3x, then setup mode"
-echo "📶 WiFi password changed → Auto-detects and enters setup mode"
+log "Setup complete. Rebooting in 10 seconds..."
+sleep 10
+reboot
