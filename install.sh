@@ -52,6 +52,13 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Check if required files exist
+if [ ! -f "$SCRIPT_DIR/server.js" ]; then
+    error "server.js not found in $SCRIPT_DIR"
+    echo "Please ensure server.js is in the same directory as this install script"
+    exit 1
+fi
+
 # Check if we're on a Raspberry Pi
 if ! grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
     warn "This doesn't appear to be a Raspberry Pi. Continuing anyway..."
@@ -175,22 +182,20 @@ log "Setting up application files..."
 mkdir -p "$TARGET_DIR" "$CONFIG_DIR" "$LOG_DIR"
 
 # Copy server files from current directory
-if [ -f "$SCRIPT_DIR/server.js" ]; then
-    cp "$SCRIPT_DIR/server.js" "$TARGET_DIR/"
-    log "Copied server.js from $SCRIPT_DIR"
-else
-    error "server.js not found in $SCRIPT_DIR"
-    echo "Please ensure server.js is in the same directory as this install script"
-    exit 1
-fi
+cp "$SCRIPT_DIR/server.js" "$TARGET_DIR/"
+log "Copied server.js from $SCRIPT_DIR"
 
+# Copy RFID service if it exists
 if [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
     cp "$SCRIPT_DIR/rfid_service.js" "$TARGET_DIR/"
     log "Copied rfid_service.js"
 fi
 
+# No npm dependencies needed - server.js uses only built-in Node.js modules
+log "Server uses built-in Node.js modules - no additional packages needed"
+
 # Set permissions
-chmod +x "$TARGET_DIR"/*.js
+chmod +x "$TARGET_DIR"/*.js 2>/dev/null || true
 chown -R root:root "$TARGET_DIR"
 
 # =======================================
@@ -245,7 +250,7 @@ else
 fi
 EOF
 
-# WiFi Client script
+# WiFi Client script  
 cat > /usr/local/bin/smartwardrobe-connect-wifi.sh << EOF
 #!/bin/bash
 CONFIG_FILE="$CONFIG_DIR/config.json"
@@ -365,7 +370,8 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-# RFID service
+# RFID service (if rfid_service.js exists)
+if [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
 cat > /etc/systemd/system/smartwardrobe-rfid.service << EOF
 [Unit]
 Description=Smart Wardrobe RFID Service
@@ -384,6 +390,7 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 # =======================================
 # Enable services
@@ -394,7 +401,7 @@ systemctl daemon-reload
 systemctl enable smartwardrobe-boot.service smartwardrobe-server.service
 systemctl enable hostapd.service dnsmasq.service
 
-if [ "$ACR122U_PRESENT" = true ]; then
+if [ "$ACR122U_PRESENT" = true ] && [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
     systemctl enable smartwardrobe-rfid.service
     log "RFID service enabled"
 fi
@@ -421,7 +428,7 @@ systemctl start smartwardrobe-boot.service
 sleep 5
 systemctl start smartwardrobe-server.service
 
-if [ "$ACR122U_PRESENT" = true ]; then
+if [ "$ACR122U_PRESENT" = true ] && [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
     systemctl start smartwardrobe-rfid.service
 fi
 
@@ -434,7 +441,7 @@ log "Verifying installation..."
 
 if systemctl is-active smartwardrobe-server.service >/dev/null; then
     log "Web server is running"
-    if curl -s http://localhost >/dev/null; then
+    if curl -s http://localhost >/dev/null 2>&1; then
         log "Web interface is accessible"
     else
         warn "Web interface not responding"
@@ -444,7 +451,7 @@ else
     systemctl status smartwardrobe-server.service
 fi
 
-if [ "$ACR122U_PRESENT" = true ]; then
+if [ "$ACR122U_PRESENT" = true ] && [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
     if systemctl is-active smartwardrobe-rfid.service >/dev/null; then
         log "RFID service is running"
     else
