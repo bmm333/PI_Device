@@ -97,7 +97,7 @@ async function processTags(tags, apiKey) {
   }
 }
 
-// Scan for RFID tags using nfcpy
+// Scan for RFID tags using PC/SC and read UUID
 function scanTags() {
   return new Promise((resolve, reject) => {
     const pythonProcess = spawn('python3', ['-c', `
@@ -106,6 +106,70 @@ import json
 import time
 from smartcard.System import readers
 from smartcard.util import toHexString
+
+def get_card_uuid(connection):
+    """
+    Read the actual UID from RFID cards using multiple methods
+    """
+    # Method 1: Standard GET UID command for ACR122U readers
+    try:
+        GET_UID = [0xFF, 0xCA, 0x00, 0x00, 0x00]
+        response, sw1, sw2 = connection.transmit(GET_UID)
+        
+        if sw1 == 0x90 and sw2 == 0x00 and len(response) > 0:
+            uuid = ''.join(['%02X' % x for x in response])
+            return uuid
+    except Exception as e:
+        pass
+    
+    # Method 2: Read UID with length parameter
+    try:
+        GET_UID_LEN = [0xFF, 0xCA, 0x00, 0x00, 0x04]  # Request 4 bytes
+        response, sw1, sw2 = connection.transmit(GET_UID_LEN)
+        
+        if sw1 == 0x90 and sw2 == 0x00 and len(response) > 0:
+            uuid = ''.join(['%02X' % x for x in response])
+            return uuid
+    except Exception as e:
+        pass
+    
+    # Method 3: Alternative UID command
+    try:
+        GET_UID_ALT = [0xFF, 0xCA, 0x01, 0x00, 0x00]
+        response, sw1, sw2 = connection.transmit(GET_UID_ALT)
+        
+        if sw1 == 0x90 and sw2 == 0x00 and len(response) > 0:
+            uuid = ''.join(['%02X' % x for x in response])
+            return uuid
+    except Exception as e:
+        pass
+    
+    # Method 4: Try to read MIFARE block 0 (contains UID)
+    try:
+        # Load authentication keys first (for MIFARE Classic)
+        LOAD_KEY = [0xFF, 0x82, 0x00, 0x00, 0x06, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        connection.transmit(LOAD_KEY)
+        
+        # Authenticate with default key
+        AUTH = [0xFF, 0x86, 0x00, 0x00, 0x05, 0x01, 0x00, 0x00, 0x60, 0x00]
+        response, sw1, sw2 = connection.transmit(AUTH)
+        
+        if sw1 == 0x90 and sw2 == 0x00:
+            # Read block 0 which contains UID
+            READ_BLOCK = [0xFF, 0xB0, 0x00, 0x00, 0x10]
+            response, sw1, sw2 = connection.transmit(READ_BLOCK)
+            
+            if sw1 == 0x90 and sw2 == 0x00 and len(response) >= 4:
+                # Extract UID (first 4 bytes for single size, first 7 for double size)
+                uid_length = 4 if response[0] != 0x88 else 7
+                uuid = ''.join(['%02X' % x for x in response[:uid_length]])
+                return uuid
+    except Exception as e:
+        pass
+    
+    # If all UID methods fail, fall back to ATR (but this means UID reading failed)
+    atr = connection.getATR()
+    return 'ATR_' + ''.join(['%02X' % x for x in atr])
 
 def scan_cards():
     try:
@@ -119,12 +183,11 @@ def scan_cards():
                 connection = reader.createConnection()
                 connection.connect()
                 
-                # Get ATR (Answer To Reset) as card identifier
-                atr = connection.getATR()
-                card_id = ''.join(['%02X' % x for x in atr])
+                # Get the UUID/UID of the card
+                card_uuid = get_card_uuid(connection)
                 
                 cards.append({
-                    'id': card_id,
+                    'id': card_uuid,
                     'signalStrength': 100,
                     'reader': str(reader)
                 })
