@@ -1,266 +1,191 @@
+const { spawn } = require('child_process');
 const fs = require('fs');
-const { exec } = require('child_process');
-const http = require('https');
+const path = require('path');
+const http = require('http');
 
+// Configuration
 const CONFIG_PATH = '/etc/smartwardrobe/config.json';
-const LOG_DIR = '/var/log/smartwardrobe';
-const DEVICE_SERIAL = '0001';
-const DEVICE_MAC = '2c:cf:67:c6:97:2c';
+const BACKEND_URL = 'http://192.168.1.4:3001'; // Development backend
+const SCAN_INTERVAL = 5000; // Scan every 5 seconds
+const HEARTBEAT_INTERVAL = 30000; // Heartbeat every 30 seconds
+const LOG_PATH = '/var/log/smartwardrobe/rfid.log';
 
-if (!fs.existsSync(LOG_DIR)) {
-  fs.mkdirSync(LOG_DIR, { recursive: true });
+// Load configuration (API key from setup)
+function loadConfig() {
+  try {
+    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    return {
+      apiKey: config.apiKey,
+      serialNumber: config.serialNumber || 'unknown'
+    };
+  } catch (error) {
+    log('ERROR', `Failed to load config: ${error.message}`);
+    process.exit(1);
+  }
 }
 
+// Logging function
 function log(level, message) {
   const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] RFID-${level}: ${message}`;
+  const logMessage = `[${timestamp}] [${level}] ${message}\n`;
   console.log(logMessage);
-  
-  try {
-    fs.appendFileSync(`${LOG_DIR}/rfid-service.log`, logMessage + '\n');
-  } catch (e) {
-    console.error('Failed to write log:', e.message);
-  }
+  fs.appendFileSync(LOG_PATH, logMessage);
 }
 
-class RFIDService {
-  constructor() {
-    this.config = null;
-    this.isRunning = false;
-    this.lastTagTime = {};
-    this.tagCooldown = 2000; // 2 seconds between same tag reads
-    
-    this.loadConfig();
-  }
-  
-  loadConfig() {
-    try {
-      if (fs.existsSync(CONFIG_PATH)) {
-        const configData = fs.readFileSync(CONFIG_PATH, 'utf8');
-        this.config = JSON.parse(configData);
-        log('INFO', 'Configuration loaded successfully');
-      } else {
-        log('WARN', 'No configuration found - waiting for setup');
-        // Check again in 30 seconds
-        setTimeout(() => this.loadConfig(), 30000);
-        return;
-      }
-    } catch (error) {
-      log('ERROR', `Failed to load config: ${error.message}`);
-      setTimeout(() => this.loadConfig(), 30000);
-      return;
-    }
-    
-    if (!this.isRunning) {
-      this.startRFIDMonitoring();
-    }
-  }
-  
-  startRFIDMonitoring() {
-    if (!this.config) {
-      log('WARN', 'Cannot start RFID monitoring - no configuration');
-      return;
-    }
-    
-    this.isRunning = true;
-    log('INFO', 'Starting RFID monitoring service');
-    
-    // Method 1: If using RC522 with Python script
-    this.startPythonRFID();
-    
-    // Method 2: If using USB/Serial RFID reader
-    // this.startSerialRFID();
-    
-  }
-  
-  // Method 1: Python RC522 integration
-  startPythonRFID() {
-    log('INFO', 'Starting Python RFID reader');
-    
-    // Create a simple Python RFID reader script if it doesn't exist
-    const pythonScript = `#!/usr/bin/env python3
-import RPi.GPIO as GPIO
-from mfrc522 import SimpleMFRC522
-import time
-import sys
-import json
-
-reader = SimpleMFRC522()
-
-try:
-    while True:
-        print("Waiting for RFID tag...", file=sys.stderr)
-        id, text = reader.read()
-        
-        # Output tag data as JSON
-        tag_data = {
-            "id": str(id),
-            "text": text.strip() if text else "",
-            "timestamp": time.time()
-        }
-        
-        print(json.dumps(tag_data))
-        sys.stdout.flush()
-        
-        time.sleep(0.5)  # Small delay to prevent spam
-        
-except KeyboardInterrupt:
-    print("RFID reader stopped", file=sys.stderr)
-finally:
-    GPIO.cleanup()
-`;
-
-    // Save Python script
-    try {
-      fs.writeFileSync('/opt/smartwardrobe/rfid_reader.py', pythonScript);
-      exec('chmod +x /opt/smartwardrobe/rfid_reader.py');
-    } catch (error) {
-      log('ERROR', `Failed to create Python script: ${error.message}`);
-    }
-    
-    // Start Python process
-    const { spawn } = require('child_process');
-    const pythonProcess = spawn('python3', ['/opt/smartwardrobe/rfid_reader.py'], {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    
-    pythonProcess.stdout.on('data', (data) => {
-      try {
-        const lines = data.toString().split('\n').filter(line => line.trim());
-        lines.forEach(line => {
-          const tagData = JSON.parse(line);
-          this.handleRFIDTag(tagData);
-        });
-      } catch (error) {
-        log('WARN', `Failed to parse RFID data: ${error.message}`);
-      }
-    });
-    
-    pythonProcess.stderr.on('data', (data) => {
-      log('DEBUG', `Python RFID: ${data.toString().trim()}`);
-    });
-    
-    pythonProcess.on('close', (code) => {
-      log('WARN', `Python RFID process exited with code ${code}`);
-      // Restart after 5 seconds
-      setTimeout(() => this.startPythonRFID(), 5000);
-    });
-  }
-  
-  // Method 2: Serial/USB RFID reader
-  startSerialRFID() {
-    log('INFO', 'Starting Serial RFID reader');
-    
-    try {
-      const SerialPort = require('serialport');
-      const port = new SerialPort('/dev/ttyUSB0', { baudRate: 9600 });
-      
-      port.on('data', (data) => {
-        const tagId = data.toString().trim();
-        if (tagId.length > 0) {
-          this.handleRFIDTag({
-            id: tagId,
-            text: '',
-            timestamp: Date.now() / 1000
-          });
-        }
-      });
-      
-      port.on('error', (error) => {
-        log('ERROR', `Serial RFID error: ${error.message}`);
-      });
-      
-    } catch (error) {
-      log('ERROR', `Failed to start serial RFID: ${error.message}`);
-    }
-  }
-  
-  handleRFIDTag(tagData) {
-    const now = Date.now();
-    const tagId = tagData.id;
-    
-    // Implement cooldown to prevent spam
-    if (this.lastTagTime[tagId] && (now - this.lastTagTime[tagId]) < this.tagCooldown) {
-      return;
-    }
-    
-    this.lastTagTime[tagId] = now;
-    
-    log('INFO', `RFID tag detected: ${tagId}`);
-    
-    // Send to backend
-    this.sendToBackend(tagData);
-  }
-  
-  async sendToBackend(tagData) {
-    if (!this.config || !this.config.backendUrl || !this.config.apiKey) {
-      log('WARN', 'No backend configuration - cannot send tag data');
-      return;
-    }
-    
-    const payload = {
-      deviceSerial: DEVICE_SERIAL,
-      deviceMac: DEVICE_MAC,
-      tagId: tagData.id,
-      tagText: tagData.text || '',
-      timestamp: new Date().toISOString(),
-      rawTimestamp: tagData.timestamp
-    };
-    
-    const postData = JSON.stringify(payload);
-    const url = new URL(this.config.backendUrl);
+// Send data to backend
+function sendToBackend(endpoint, data, apiKey) {
+  return new Promise((resolve, reject) => {
+    const url = `${BACKEND_URL}${endpoint}`;
+    const payload = JSON.stringify(data);
     
     const options = {
-      hostname: url.hostname,
-      port: url.port || 443,
-      path: '/api/rfid/tag-event',  // Adjust this endpoint as needed
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.config.apiKey}`,
-        'Content-Length': Buffer.byteLength(postData)
+        'x-api-key': apiKey,
+        'Content-Length': Buffer.byteLength(payload)
       }
     };
-    
-    const req = http.request(options, (res) => {
-      let data = '';
-      
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      
+
+    const req = http.request(url, options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => body += chunk);
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          log('INFO', `Tag event sent successfully: ${tagData.id}`);
+          log('INFO', `Backend response: ${body}`);
+          resolve(JSON.parse(body));
         } else {
-          log('ERROR', `Backend returned ${res.statusCode}: ${data}`);
+          reject(new Error(`HTTP ${res.statusCode}: ${body}`));
         }
       });
     });
-    
+
     req.on('error', (error) => {
-      log('ERROR', `Failed to send tag event: ${error.message}`);
+      reject(error);
     });
-    
-    req.write(postData);
+
+    req.write(payload);
     req.end();
-  }
-  
-  // Graceful shutdown
-  shutdown() {
-    log('INFO', 'RFID service shutting down');
-    this.isRunning = false;
-    process.exit(0);
+  });
+}
+
+// Send heartbeat to backend
+async function sendHeartbeat(apiKey) {
+  try {
+    await sendToBackend('/rfid/heartbeat', {}, apiKey);
+    log('INFO', 'Heartbeat sent successfully');
+  } catch (error) {
+    log('ERROR', `Heartbeat failed: ${error.message}`);
   }
 }
 
-const rfidService = new RFIDService();
+// Process detected tags and send to backend
+async function processTags(tags, apiKey) {
+  if (tags.length === 0) return;
 
-// Handle graceful shutdown
-process.on('SIGINT', () => rfidService.shutdown());
-process.on('SIGTERM', () => rfidService.shutdown());
+  const detectedTags = tags.map(tag => ({
+    tagId: tag.id,
+    event: 'detected',
+    signalStrength: tag.signalStrength || 0
+  }));
 
-process.on('uncaughtException', (error) => {
-  log('ERROR', `Uncaught exception: ${error.message}`);
+  try {
+    const response = await sendToBackend('/rfid/scan', { detectedTags }, apiKey);
+    log('INFO', `Tags processed: ${detectedTags.length} sent, response: ${JSON.stringify(response)}`);
+  } catch (error) {
+    log('ERROR', `Failed to send tags: ${error.message}`);
+  }
+}
+
+// Scan for RFID tags using nfcpy
+function scanTags() {
+  return new Promise((resolve, reject) => {
+    const pythonProcess = spawn('python3', ['-c', `
+import nfc
+import sys
+import json
+
+def on_connect(tag):
+    tag_id = tag.identifier.hex().upper()
+    signal_strength = getattr(tag, 'signal_strength', 0)
+    print(json.dumps({'id': tag_id, 'signalStrength': signal_strength}))
+    return False  # Continue scanning
+
+try:
+    with nfc.ContactlessFrontend('usb') as clf:
+        clf.connect(rdwr={'on-connect': on_connect}, terminate=5.0)  # Scan for 5 seconds
+except Exception as e:
+    print(json.dumps({'error': str(e)}), file=sys.stderr)
+    sys.exit(1)
+`]);
+
+    let output = '';
+    let errorOutput = '';
+
+    pythonProcess.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+
+    pythonProcess.stderr.on('data', (data) => {
+      errorOutput += data.toString();
+    });
+
+    pythonProcess.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`nfcpy error: ${errorOutput}`));
+        return;
+      }
+
+      try {
+        const tags = output.trim().split('\n').map(line => JSON.parse(line)).filter(tag => !tag.error);
+        resolve(tags);
+      } catch (parseError) {
+        reject(new Error(`Parse error: ${parseError.message}, output: ${output}`));
+      }
+    });
+
+    pythonProcess.on('error', (error) => {
+      reject(new Error(`Process error: ${error.message}`));
+    });
+  });
+}
+
+// Main service loop
+async function main() {
+  const config = loadConfig();
+  log('INFO', `Starting RFID service for device: ${config.serialNumber}`);
+
+  // Heartbeat timer
+  const heartbeatTimer = setInterval(() => sendHeartbeat(config.apiKey), HEARTBEAT_INTERVAL);
+
+  // Scanning loop
+  while (true) {
+    try {
+      const tags = await scanTags();
+      if (tags.length > 0) {
+        log('INFO', `Detected tags: ${tags.map(t => t.id).join(', ')}`);
+        await processTags(tags, config.apiKey);
+      }
+    } catch (error) {
+      log('ERROR', `Scan failed: ${error.message}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, SCAN_INTERVAL));
+  }
+}
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  log('INFO', 'Shutting down RFID service');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  log('INFO', 'Shutting down RFID service');
+  process.exit(0);
+});
+
+// Start the service
+main().catch((error) => {
+  log('ERROR', `Service crashed: ${error.message}`);
   process.exit(1);
 });
