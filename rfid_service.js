@@ -104,6 +104,7 @@ function scanTags() {
 import nfc
 import sys
 import json
+import time
 
 def on_connect(tag):
     tag_id = tag.identifier.hex().upper()
@@ -112,8 +113,16 @@ def on_connect(tag):
     return False  # Continue scanning
 
 try:
-    with nfc.ContactlessFrontend('usb') as clf:
-        clf.connect(rdwr={'on-connect': on_connect}, terminate=5.0)  # Scan for 5 seconds
+    # Try multiple connection methods
+    for method in ['pcsc', 'usb']:
+        try:
+            with nfc.ContactlessFrontend(method) as clf:
+                clf.connect(rdwr={'on-connect': on_connect}, terminate=5.0)
+                break
+        except Exception as e:
+            if method == 'usb':  # Last attempt failed
+                raise e
+            continue
 except Exception as e:
     print(json.dumps({'error': str(e)}), file=sys.stderr)
     sys.exit(1)
