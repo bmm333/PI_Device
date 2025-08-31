@@ -2,7 +2,7 @@
 set -e
 
 # =======================================
-# Smart Wardrobe Complete Installer - ROBUST VERSION
+# Smart Wardrobe Complete Installer
 # =======================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,7 +43,7 @@ error() {
 
 echo -e "${BLUE}"
 echo "=============================================="
-echo "   Smart Wardrobe Device Setup - ROBUST"
+echo "   Smart Wardrobe Device Setup - ONE COMMAND"
 echo "=============================================="
 echo -e "${NC}"
 
@@ -60,18 +60,13 @@ if [ ! -f "$SCRIPT_DIR/server.js" ]; then
     exit 1
 fi
 
-# Check for RFID service
+# Check for RFID service - ALWAYS ENABLE IT
 if [ -f "$SCRIPT_DIR/rfid_service.js" ]; then
-    log "rfid_service.js found - RFID support will be enabled"
+    log "rfid_service.js found - RFID support ENABLED"
     RFID_SERVICE_PRESENT=true
 else
     warn "rfid_service.js not found - RFID support will be disabled"
     RFID_SERVICE_PRESENT=false
-fi
-
-# Check if we're on a Raspberry Pi
-if ! grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
-    warn "This doesn't appear to be a Raspberry Pi. Continuing anyway..."
 fi
 
 # Check internet connectivity
@@ -109,22 +104,13 @@ if [ -z "$WIFI_IFACE" ]; then
 fi
 log "WiFi interface detected: $WIFI_IFACE"
 
-# Check for ACR122U
-if lsusb | grep -qi "072f:2200\|Advanced Card Systems"; then
-    log "ACR122U NFC reader detected"
-    ACR122U_PRESENT=true
-else
-    warn "ACR122U not detected. You can connect it later."
-    ACR122U_PRESENT=false
-fi
-
 # =======================================
 # Clean up any existing installation
 # =======================================
 
 log "Cleaning up any previous installation..."
-systemctl stop smartwardrobe-boot.service smartwardrobe-server.service smartwardrobe-rfid.service 2>/dev/null || true
-systemctl disable smartwardrobe-boot.service smartwardrobe-server.service smartwardrobe-rfid.service 2>/dev/null || true
+systemctl stop smartwardrobe-boot.service smartwardrobe-server.service smartwardrobe-rfid.service smartwardrobe-watchdog.service 2>/dev/null || true
+systemctl disable smartwardrobe-boot.service smartwardrobe-server.service smartwardrobe-rfid.service smartwardrobe-watchdog.service 2>/dev/null || true
 systemctl daemon-reload
 
 # =======================================
@@ -135,7 +121,7 @@ log "Updating package lists..."
 apt update || { error "apt update failed"; exit 1; }
 
 log "Installing system packages..."
-PACKAGES="hostapd dnsmasq iptables-persistent netfilter-persistent jq nodejs npm python3-pip libusb-1.0-0-dev libnfc-dev pcscd pcsc-tools libccid python3-setuptools python3-dev build-essential"
+PACKAGES="hostapd dnsmasq iptables-persistent netfilter-persistent jq nodejs npm python3-pip libusb-1.0-0-dev libnfc-dev pcscd pcsc-tools libccid python3-setuptools python3-dev build-essential curl"
 
 # Install packages one by one to catch failures
 for package in $PACKAGES; do
@@ -145,40 +131,71 @@ for package in $PACKAGES; do
     fi
 done
 
-# Install Python packages for RFID if needed
-if [ "$RFID_SERVICE_PRESENT" = true ]; then
-    log "Installing Python NFC libraries..."
+# =======================================
+# ALWAYS INSTALL RFID DEPENDENCIES - NO STUPID HARDWARE CHECKS
+# =======================================
+
+log "Installing Python RFID libraries (ALWAYS - no hardware check)..."
+
+# Try multiple installation methods until one works
+PYSCARD_INSTALLED=false
+
+# Method 1: With break-system-packages flag (Python 3.11+)
+if pip3 install --break-system-packages pyscard 2>/dev/null; then
+    log "pyscard installed with --break-system-packages"
+    PYSCARD_INSTALLED=true
+# Method 2: Regular pip3
+elif pip3 install pyscard 2>/dev/null; then
+    log "pyscard installed with pip3"
+    PYSCARD_INSTALLED=true
+# Method 3: System package manager
+elif apt install -y python3-pyscard 2>/dev/null; then
+    log "pyscard installed from system packages"
+    PYSCARD_INSTALLED=true
+# Method 4: Alternative pip
+elif python3 -m pip install pyscard 2>/dev/null; then
+    log "pyscard installed with python3 -m pip"
+    PYSCARD_INSTALLED=true
+# Method 5: Force install with pip
+elif pip install pyscard 2>/dev/null; then
+    log "pyscard installed with pip"
+    PYSCARD_INSTALLED=true
+else
+    warn "All pyscard installation methods failed - installing build dependencies first"
     
-    # Try multiple installation methods
+    # Install build dependencies and try again
+    apt install -y python3-dev python3-pip python3-setuptools build-essential libpcsclite-dev swig
+    
     if pip3 install --break-system-packages pyscard 2>/dev/null; then
-        log "pyscard installed with --break-system-packages"
-    elif pip3 install pyscard 2>/dev/null; then
-        log "pyscard installed without --break-system-packages"
-    elif pip install pyscard 2>/dev/null; then
-        log "pyscard installed with pip"
+        log "pyscard installed after installing build dependencies"
+        PYSCARD_INSTALLED=true
     else
-        warn "Failed to install pyscard - RFID service may not work"
+        error "pyscard installation completely failed - RFID will not work"
         RFID_SERVICE_PRESENT=false
     fi
-    
-    # Verify installation
+fi
+
+# Verify pyscard installation
+if [ "$PYSCARD_INSTALLED" = true ]; then
     if python3 -c "import smartcard; print('pyscard working')" 2>/dev/null; then
         log "pyscard verification successful"
     else
-        warn "pyscard verification failed - disabling RFID service"
+        warn "pyscard installed but verification failed"
         RFID_SERVICE_PRESENT=false
     fi
 fi
 
 # =======================================
-# Stop conflicting services and unmask
+# Stop conflicting services and unmask everything
 # =======================================
 
-log "Stopping and unmasking services..."
-# First unmask critical services that might be masked
-systemctl unmask hostapd.service 2>/dev/null || true
-systemctl unmask dnsmasq.service 2>/dev/null || true
-systemctl unmask NetworkManager.service 2>/dev/null || true
+log "Stopping and unmasking all potentially masked services..."
+
+# Unmask EVERYTHING that might be masked
+SERVICES_TO_UNMASK="hostapd.service dnsmasq.service NetworkManager.service wpa_supplicant.service dhcpcd.service pcscd.service"
+for service in $SERVICES_TO_UNMASK; do
+    systemctl unmask "$service" 2>/dev/null || true
+done
 
 # Stop conflicting services
 systemctl stop wpa_supplicant dhcpcd NetworkManager hostapd dnsmasq 2>/dev/null || true
@@ -190,7 +207,7 @@ pkill -f dhclient || true
 pkill -f hostapd || true
 pkill -f dnsmasq || true
 
-log "Services unmasked and stopped"
+log "All services unmasked and conflicting services stopped"
 
 # =======================================
 # Configure Access Point
@@ -445,147 +462,259 @@ EOF
 # Make scripts executable
 chmod +x /usr/local/bin/smartwardrobe-*.sh
 
-# Create symlink for compatibility
-ln -sf /usr/local/bin/smartwardrobe-connect-wifi.sh /usr/local/bin/smartwardrobe-connection-manager.sh
-
 # =======================================
-# Create systemd services
+# Create INTEGRATED WATCHDOG SYSTEM
 # =======================================
 
-log "Creating systemd services..."
+log "Creating integrated watchdog system..."
 
-# Boot Manager Service
-cat > /etc/systemd/system/smartwardrobe-boot.service << EOF
-[Unit]
-Description=Smart Wardrobe Boot Network Manager
-After=multi-user.target systemd-networkd.service
-Before=smartwardrobe-server.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'if [ -f "$CONFIG_DIR/config.json" ]; then /usr/local/bin/smartwardrobe-connect-wifi.sh; else /usr/local/bin/smartwardrobe-force-ap.sh; fi'
-RemainAfterExit=yes
-TimeoutStartSec=120
-StandardOutput=append:$LOG_DIR/boot.log
-StandardError=append:$LOG_DIR/boot.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Web Server Service - with better startup
-cat > /etc/systemd/system/smartwardrobe-server.service << EOF
-[Unit]
-Description=Smart Wardrobe Web Server
-After=smartwardrobe-boot.service network.target
-Wants=smartwardrobe-boot.service network.target
-
-[Service]
-Type=simple
-ExecStartPre=/bin/sleep 10
-ExecStart=/usr/bin/node $TARGET_DIR/server.js
-WorkingDirectory=$TARGET_DIR
-StandardOutput=append:$LOG_DIR/server.log
-StandardError=append:$LOG_DIR/server.log
-User=root
-Group=root
-Restart=always
-RestartSec=5
-StartLimitBurst=10
-StartLimitIntervalSec=300
-
-# Ensure service starts even if network isn't fully ready
-TimeoutStartSec=60
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# RFID Service with better error handling and restart logic
-if [ "$RFID_SERVICE_PRESENT" = true ]; then
-    # Create enhanced device waiting script
-    cat > /usr/local/bin/wait-for-acr122u.sh << 'EOF'
+# Main watchdog script with RFID reset capabilities
+cat > /usr/local/bin/smartwardrobe-watchdog.sh << 'WATCHDOG_SCRIPT'
 #!/bin/bash
-LOG_FILE="/var/log/smartwardrobe/rfid.log"
+
+# Smart Wardrobe Watchdog Service - INTEGRATED VERSION
+LOG_DIR="/var/log/smartwardrobe"
+LOG_FILE="$LOG_DIR/watchdog.log"
+CHECK_INTERVAL=30  # Check every 30 seconds
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR"
+chmod 755 "$LOG_DIR"
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WATCHDOG: $1" | tee -a "$LOG_FILE"
+}
+
+check_and_restart_service() {
+    local service_name="$1"
+    local display_name="$2"
+    
+    if ! systemctl is-active "$service_name" >/dev/null 2>&1; then
+        log "$display_name is DOWN - attempting restart"
+        
+        if systemctl restart "$service_name"; then
+            sleep 5
+            if systemctl is-active "$service_name" >/dev/null 2>&1; then
+                log "$display_name successfully restarted"
+                return 0
+            else
+                log "$display_name restart FAILED - service still not active"
+                return 1
+            fi
+        else
+            log "$display_name restart command FAILED"
+            return 1
+        fi
+    else
+        log "$display_name is running OK"
+        return 0
+    fi
 }
 
 reset_acr122u() {
-    log "Attempting to reset ACR122U..."
+    log "Resetting ACR122U due to failures..."
     
-    # Try to reset USB device
+    # Stop RFID service
+    systemctl stop smartwardrobe-rfid.service
+    
+    # Reset USB device
     for device in /sys/bus/usb/devices/*; do
         if [ -f "$device/idVendor" ] && [ -f "$device/idProduct" ]; then
             vendor=$(cat "$device/idVendor" 2>/dev/null)
             product=$(cat "$device/idProduct" 2>/dev/null)
             if [ "$vendor" = "072f" ] && [ "$product" = "2200" ]; then
-                log "Found ACR122U at $device, attempting reset..."
+                log "Resetting ACR122U USB device..."
                 echo 0 > "$device/authorized" 2>/dev/null || true
-                sleep 2
-                echo 1 > "$device/authorized" 2>/dev/null || true
                 sleep 3
+                echo 1 > "$device/authorized" 2>/dev/null || true
+                sleep 5
                 break
             fi
         fi
     done
     
     # Restart PC/SC service
+    log "Restarting PC/SC service..."
     systemctl restart pcscd
     sleep 5
+    
+    # Restart RFID service
+    log "Restarting RFID service..."
+    systemctl start smartwardrobe-rfid.service
+    
+    log "ACR122U reset complete"
 }
 
-log "Waiting for ACR122U device to be ready..."
-
-# Start PC/SC service if not running
-if ! systemctl is-active pcscd >/dev/null 2>&1; then
-    log "Starting PC/SC service..."
-    systemctl start pcscd || true
-    sleep 3
-fi
-
-# Wait up to 60 seconds for ACR122U to be ready
-for i in {1..60}; do
-    # Check if USB device is present
-    if lsusb | grep -qi "072f:2200\|Advanced Card Systems"; then
-        log "ACR122U USB device detected (attempt $i/60)"
-        sleep 2
-        
-        # Check if PC/SC can see it
-        if timeout 10 pcsc_scan -n 2>/dev/null | grep -q "Reader"; then
-            log "ACR122U is ready and accessible"
-            exit 0
-        else
-            log "ACR122U detected but not accessible via PC/SC"
-            
-            # Try reset every 10 attempts
-            if [ $((i % 10)) -eq 0 ]; then
-                reset_acr122u
-            fi
-        fi
-    else
-        log "Waiting for ACR122U USB device (attempt $i/60)"
+check_network_connectivity() {
+    local mode_file="/tmp/smartwardrobe-mode"
+    local current_mode="unknown"
+    
+    if [ -f "$mode_file" ]; then
+        current_mode=$(cat "$mode_file")
     fi
     
-    sleep 1
+    case "$current_mode" in
+        "ap")
+            # In AP mode, check if hostapd and dnsmasq are running
+            if ! systemctl is-active hostapd >/dev/null 2>&1; then
+                log "AP mode: hostapd is down, restarting..."
+                systemctl restart hostapd
+            fi
+            
+            if ! systemctl is-active dnsmasq >/dev/null 2>&1; then
+                log "AP mode: dnsmasq is down, restarting..."
+                systemctl restart dnsmasq
+            fi
+            
+            # Check if AP interface has correct IP
+            if ! ip addr show | grep -q "192.168.4.1"; then
+                log "AP mode: Missing IP address, triggering network restart"
+                /usr/local/bin/smartwardrobe-force-ap.sh &
+            fi
+            ;;
+            
+        "client")
+            # In client mode, check internet connectivity
+            if ! ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1; then
+                log "Client mode: No internet connectivity detected"
+            fi
+            ;;
+            
+        *)
+            log "Unknown network mode, checking if any network is configured"
+            if [ ! -f "/etc/smartwardrobe/config.json" ]; then
+                log "No config found, ensuring AP mode is running"
+                /usr/local/bin/smartwardrobe-force-ap.sh &
+            fi
+            ;;
+    esac
+}
+
+check_web_server_response() {
+    # Try to connect to the web server
+    if ! curl -s --connect-timeout 5 http://localhost >/dev/null 2>&1; then
+        log "Web server not responding to HTTP requests"
+        return 1
+    else
+        log "Web server responding to HTTP requests OK"
+        return 0
+    fi
+}
+
+check_rfid_service_health() {
+    # Check if RFID service is enabled first
+    if systemctl is-enabled smartwardrobe-rfid.service >/dev/null 2>&1; then
+        # Check if it's running
+        if systemctl is-active smartwardrobe-rfid.service >/dev/null 2>&1; then
+            # Check if it's actually working by looking at recent logs
+            local recent_errors=$(journalctl -u smartwardrobe-rfid.service --since "5 minutes ago" | grep -c "error\|Error\|ERROR" 2>/dev/null || echo "0")
+            local recent_scans=$(journalctl -u smartwardrobe-rfid.service --since "5 minutes ago" | grep -c "Scan failed\|PC/SC error" 2>/dev/null || echo "0")
+            
+            if [ "$recent_scans" -gt 10 ]; then
+                log "RFID service showing many scan failures ($recent_scans in 5 min) - resetting ACR122U"
+                reset_acr122u &
+                return 1
+            fi
+            
+            # Check restart count
+            local restart_count=$(systemctl show smartwardrobe-rfid.service -p NRestarts --value 2>/dev/null || echo "0")
+            if [ "$restart_count" -gt 10 ]; then
+                log "RFID service has restarted $restart_count times - triggering device reset"
+                reset_acr122u &
+                return 1
+            fi
+            
+            # Check if ACR122U is still physically accessible
+            if ! timeout 5 pcsc_scan -n 2>/dev/null | grep -q "Reader"; then
+                log "ACR122U not accessible via PC/SC - triggering reset"
+                reset_acr122u &
+                return 1
+            fi
+            
+        fi
+        return 0
+    else
+        # RFID service is disabled, that's OK
+        return 0
+    fi
+}
+
+perform_system_health_check() {
+    log "=== Starting system health check ==="
+    
+    # Check core Smart Wardrobe services
+    check_and_restart_service "smartwardrobe-boot.service" "Boot Manager"
+    sleep 2
+    
+    check_and_restart_service "smartwardrobe-server.service" "Web Server"
+    sleep 2
+    
+    # Check if RFID service should be running
+    if systemctl is-enabled smartwardrobe-rfid.service >/dev/null 2>&1; then
+        check_and_restart_service "smartwardrobe-rfid.service" "RFID Service"
+        check_rfid_service_health
+        sleep 2
+    fi
+    
+    # Check network services based on current mode
+    check_network_connectivity
+    
+    # Check if web server is actually responding
+    sleep 5  # Give services time to start
+    check_web_server_response
+    
+    # Check system resources
+    local mem_usage=$(free | awk 'NR==2{printf "%.1f%%", $3/$2*100}' 2>/dev/null || echo "unknown")
+    local disk_usage=$(df / | awk 'NR==2{print $5}' | sed 's/%//' 2>/dev/null || echo "0")
+    
+    log "System resources: Memory: $mem_usage, Disk: $disk_usage%"
+    
+    if [ "$disk_usage" -gt 90 ] 2>/dev/null; then
+        log "WARNING: Disk usage is high ($disk_usage%)"
+    fi
+    
+    log "=== Health check completed ==="
+}
+
+# Startup message
+log "Smart Wardrobe Watchdog starting up..."
+log "Check interval: ${CHECK_INTERVAL} seconds"
+
+# Perform initial health check after a delay to let system boot
+sleep 60
+log "Performing initial system health check..."
+perform_system_health_check
+
+# Main watchdog loop
+while true; do
+    sleep "$CHECK_INTERVAL"
+    
+    # Quick check every cycle
+    if ! systemctl is-active smartwardrobe-server.service >/dev/null 2>&1; then
+        log "CRITICAL: Web server is down, immediate restart"
+        check_and_restart_service "smartwardrobe-server.service" "Web Server"
+    fi
+    
+    # Full health check every 5 minutes
+    if [ $(($(date +%s) % 300)) -lt "$CHECK_INTERVAL" ]; then
+        perform_system_health_check
+    fi
 done
+WATCHDOG_SCRIPT
 
-log "WARNING: ACR122U not ready after 60 seconds, starting service anyway"
-exit 0
-EOF
-    chmod +x /usr/local/bin/wait-for-acr122u.sh
+chmod +x /usr/local/bin/smartwardrobe-watchdog.sh
 
-    # Create enhanced RFID reset script for when it stops working
-    cat > /usr/local/bin/reset-acr122u.sh << 'EOF'
+# Create RFID utility scripts for manual troubleshooting
+cat > /usr/local/bin/fix-rfid << 'FIX_RFID'
 #!/bin/bash
+echo "=== Fixing RFID Reader ==="
 LOG_FILE="/var/log/smartwardrobe/rfid.log"
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESET: $1" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] MANUAL: $1" | tee -a "$LOG_FILE"
 }
 
-log "Resetting ACR122U due to read failures..."
+log "Manual RFID reset initiated"
 
 # Stop RFID service
 systemctl stop smartwardrobe-rfid.service
@@ -615,9 +744,136 @@ sleep 5
 log "Restarting RFID service..."
 systemctl start smartwardrobe-rfid.service
 
-log "ACR122U reset complete"
+echo "RFID reader reset complete!"
+echo "Check status with: sudo rfid-status"
+FIX_RFID
+
+cat > /usr/local/bin/rfid-status << 'RFID_STATUS'
+#!/bin/bash
+echo "=== RFID Service Status ==="
+systemctl status smartwardrobe-rfid.service --no-pager -l
+echo
+echo "=== Recent RFID Logs ==="
+journalctl -u smartwardrobe-rfid.service -n 20 --no-pager
+echo
+echo "=== USB Device Status ==="
+lsusb | grep -i "072f\|advanced card" || echo "No ACR122U detected"
+echo
+echo "=== PC/SC Status ==="
+timeout 5 pcsc_scan -n 2>/dev/null || echo "PC/SC scan failed or no readers"
+echo
+echo "=== Python pyscard test ==="
+python3 -c "import smartcard; print('pyscard module working!')" 2>/dev/null || echo "pyscard module not working"
+RFID_STATUS
+
+cat > /usr/local/bin/rfid-logs << 'RFID_LOGS'
+#!/bin/bash
+echo "=== Live RFID Logs ==="
+echo "Press Ctrl+C to exit"
+journalctl -u smartwardrobe-rfid.service -f
+RFID_LOGS
+
+chmod +x /usr/local/bin/fix-rfid
+chmod +x /usr/local/bin/rfid-status
+chmod +x /usr/local/bin/rfid-logs
+
+# =======================================
+# Create systemd services
+# =======================================
+
+log "Creating systemd services..."
+
+# Boot Manager Service
+cat > /etc/systemd/system/smartwardrobe-boot.service << EOF
+[Unit]
+Description=Smart Wardrobe Boot Network Manager
+After=multi-user.target systemd-networkd.service
+Before=smartwardrobe-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'if [ -f "$CONFIG_DIR/config.json" ]; then /usr/local/bin/smartwardrobe-connect-wifi.sh; else /usr/local/bin/smartwardrobe-force-ap.sh; fi'
+RemainAfterExit=yes
+TimeoutStartSec=120
+StandardOutput=append:$LOG_DIR/boot.log
+StandardError=append:$LOG_DIR/boot.log
+
+[Install]
+WantedBy=multi-user.target
 EOF
-    chmod +x /usr/local/bin/reset-acr122u.sh
+
+# Web Server Service - with startup delay
+cat > /etc/systemd/system/smartwardrobe-server.service << EOF
+[Unit]
+Description=Smart Wardrobe Web Server
+After=smartwardrobe-boot.service network.target
+Wants=smartwardrobe-boot.service network.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 15
+ExecStart=/usr/bin/node $TARGET_DIR/server.js
+WorkingDirectory=$TARGET_DIR
+StandardOutput=append:$LOG_DIR/server.log
+StandardError=append:$LOG_DIR/server.log
+User=root
+Group=root
+Restart=always
+RestartSec=5
+StartLimitBurst=0
+
+# Ensure service starts even if network isn't fully ready
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# RFID Service with enhanced error handling
+if [ "$RFID_SERVICE_PRESENT" = true ]; then
+    # Create device waiting script
+    cat > /usr/local/bin/wait-for-acr122u.sh << 'EOF'
+#!/bin/bash
+LOG_FILE="/var/log/smartwardrobe/rfid.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+log "Waiting for ACR122U device to be ready..."
+
+# Start PC/SC service if not running
+if ! systemctl is-active pcscd >/dev/null 2>&1; then
+    log "Starting PC/SC service..."
+    systemctl start pcscd || true
+    sleep 3
+fi
+
+# Wait up to 60 seconds for ACR122U to be ready
+for i in {1..60}; do
+    # Check if USB device is present
+    if lsusb | grep -qi "072f:2200\|Advanced Card Systems"; then
+        log "ACR122U USB device detected (attempt $i/60)"
+        sleep 2
+        
+        # Check if PC/SC can see it
+        if timeout 10 pcsc_scan -n 2>/dev/null | grep -q "Reader"; then
+            log "ACR122U is ready and accessible"
+            exit 0
+        else
+            log "ACR122U detected but not accessible via PC/SC"
+        fi
+    else
+        log "Waiting for ACR122U USB device (attempt $i/60)"
+    fi
+    
+    sleep 1
+done
+
+log "WARNING: ACR122U not ready after 60 seconds, starting service anyway"
+exit 0
+EOF
+    chmod +x /usr/local/bin/wait-for-acr122u.sh
 
     cat > /etc/systemd/system/smartwardrobe-rfid.service << EOF
 [Unit]
@@ -635,11 +891,7 @@ User=root
 Group=root
 Restart=always
 RestartSec=15
-StartLimitBurst=5
-StartLimitIntervalSec=300
-
-# If service fails 3 times, try resetting the device
-ExecStartPost=/bin/bash -c 'if [ $(systemctl show smartwardrobe-rfid.service -p NRestarts --value) -gt 3 ]; then /usr/local/bin/reset-acr122u.sh; fi'
+StartLimitBurst=0
 
 [Install]
 WantedBy=multi-user.target
@@ -651,6 +903,28 @@ else
     log "RFID service not configured - rfid_service.js not found"
     ENABLE_RFID=false
 fi
+
+# Watchdog Service
+cat > /etc/systemd/system/smartwardrobe-watchdog.service << EOF
+[Unit]
+Description=Smart Wardrobe Watchdog Service
+After=multi-user.target network.target smartwardrobe-boot.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smartwardrobe-watchdog.sh
+StandardOutput=append:$LOG_DIR/watchdog.log
+StandardError=append:$LOG_DIR/watchdog.log
+User=root
+Group=root
+Restart=always
+RestartSec=10
+StartLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # =======================================
 # Configure udev rules for ACR122U
@@ -685,6 +959,7 @@ systemctl enable netfilter-persistent || warn "Failed to enable netfilter-persis
 # Enable our custom services
 systemctl enable smartwardrobe-boot.service || error "Failed to enable boot service"
 systemctl enable smartwardrobe-server.service || error "Failed to enable server service"
+systemctl enable smartwardrobe-watchdog.service || error "Failed to enable watchdog service"
 
 if [ "$ENABLE_RFID" = true ]; then
     systemctl enable smartwardrobe-rfid.service || warn "Failed to enable RFID service"
@@ -695,30 +970,41 @@ systemctl start pcscd.service || warn "Failed to start pcscd"
 systemctl start netfilter-persistent || warn "Failed to start netfilter-persistent"
 
 # =======================================
-# Create test scripts for debugging
+# Create debug and utility scripts
 # =======================================
 
-log "Creating debug scripts..."
+log "Creating debug and utility scripts..."
+
 cat > /usr/local/bin/smartwardrobe-debug.sh << 'EOF'
 #!/bin/bash
 echo "=== Smart Wardrobe Debug Information ==="
 echo
 echo "=== Service Status ==="
+echo "Boot Service:"
 systemctl status smartwardrobe-boot.service --no-pager -l
 echo
+echo "Web Server:"
 systemctl status smartwardrobe-server.service --no-pager -l
 echo
+echo "RFID Service:"
 systemctl status smartwardrobe-rfid.service --no-pager -l 2>/dev/null || echo "RFID service not available"
 echo
-echo "=== Network Status ==="
-echo "WiFi Interface: $(ip link show | grep wl | head -1 | cut -d: -f2 | tr -d ' ')"
-echo "IP Addresses:"
-ip addr show | grep inet
+echo "Watchdog Service:"
+systemctl status smartwardrobe-watchdog.service --no-pager -l
 echo
-echo "=== Processes ==="
+echo "=== Network Status ==="
+echo "WiFi Interface: $(ip link show | grep wl | head -1 | cut -d: -f2 | tr -d ' ' 2>/dev/null || echo 'none')"
+echo "Current Mode: $(cat /tmp/smartwardrobe-mode 2>/dev/null || echo 'unknown')"
+echo "IP Addresses:"
+ip addr show | grep inet | grep -v 127.0.0.1
+echo
+echo "=== Active Processes ==="
 ps aux | grep -E "(node|hostapd|dnsmasq)" | grep -v grep
 echo
-echo "=== Recent Logs ==="
+echo "=== USB Devices ==="
+lsusb | grep -i "072f\|advanced card" || echo "No ACR122U detected"
+echo
+echo "=== Recent Logs (last 10 lines each) ==="
 echo "--- Boot Service ---"
 journalctl -u smartwardrobe-boot.service --no-pager -n 10
 echo
@@ -727,39 +1013,69 @@ journalctl -u smartwardrobe-server.service --no-pager -n 10
 echo
 echo "--- RFID Service ---"
 journalctl -u smartwardrobe-rfid.service --no-pager -n 10 2>/dev/null || echo "No RFID logs"
+echo
+echo "--- Watchdog Service ---"
+journalctl -u smartwardrobe-watchdog.service --no-pager -n 10
 EOF
 
+cat > /usr/local/bin/smartwardrobe-restart-all << 'RESTART_ALL'
+#!/bin/bash
+echo "=== Restarting All Smart Wardrobe Services ==="
+systemctl restart smartwardrobe-boot.service
+sleep 5
+systemctl restart smartwardrobe-server.service
+systemctl restart smartwardrobe-rfid.service 2>/dev/null || true
+systemctl restart smartwardrobe-watchdog.service
+echo "All services restarted!"
+echo "Check status with: sudo smartwardrobe-debug"
+RESTART_ALL
+
 chmod +x /usr/local/bin/smartwardrobe-debug.sh
+chmod +x /usr/local/bin/smartwardrobe-restart-all
 
 # =======================================
-# Final verification and startup
+# Final service startup
 # =======================================
 
 log "Starting Smart Wardrobe services..."
+
+# Start boot service first
 systemctl start smartwardrobe-boot.service || {
     error "Boot service failed to start"
     journalctl -u smartwardrobe-boot.service --no-pager -n 20
 }
 
-sleep 10
+sleep 15
 
+# Start web server
 systemctl start smartwardrobe-server.service || {
     error "Server service failed to start"
     journalctl -u smartwardrobe-server.service --no-pager -n 20
 }
 
+sleep 5
+
+# Start RFID service if available
 if [ "$ENABLE_RFID" = true ]; then
     systemctl start smartwardrobe-rfid.service || {
         warn "RFID service failed to start"
-        journalctl -u smartwardrobe-rfid.service --no-pager -n 20
+        journalctl -u smartwardrobe-rfid.service --no-pager -n 10
     }
 fi
 
-# Wait for services to initialize
-sleep 15
+sleep 5
+
+# Start watchdog last
+systemctl start smartwardrobe-watchdog.service || {
+    error "Watchdog service failed to start"
+    journalctl -u smartwardrobe-watchdog.service --no-pager -n 10
+}
+
+# Wait for services to fully initialize
+sleep 10
 
 # =======================================
-# Final status check
+# Final status check and completion
 # =======================================
 
 log "Checking final service status..."
@@ -767,54 +1083,95 @@ log "Checking final service status..."
 BOOT_STATUS=$(systemctl is-active smartwardrobe-boot.service || echo "failed")
 SERVER_STATUS=$(systemctl is-active smartwardrobe-server.service || echo "failed")
 RFID_STATUS=$(systemctl is-active smartwardrobe-rfid.service 2>/dev/null || echo "disabled")
+WATCHDOG_STATUS=$(systemctl is-active smartwardrobe-watchdog.service || echo "failed")
 
 echo
 echo -e "${GREEN}=============================================="
-echo "   Installation Complete!"
+echo "   SMART WARDROBE INSTALLATION COMPLETE!"
 echo "=============================================="
 echo -e "${NC}"
 echo
 echo "Service Status:"
-echo "  Boot Service: $BOOT_STATUS"
-echo "  Web Server: $SERVER_STATUS"
-echo "  RFID Service: $RFID_STATUS"
+echo "  ✓ Boot Manager: $BOOT_STATUS"
+echo "  ✓ Web Server: $SERVER_STATUS"
+echo "  ✓ RFID Service: $RFID_STATUS"
+echo "  ✓ Watchdog: $WATCHDOG_STATUS"
 echo
-echo "Your Smart Wardrobe device should now be running:"
+echo "WiFi Access Point:"
 echo "  • SSID: SmartWardrobe-Setup"
 echo "  • Password: smartwardrobe123"
 echo "  • Setup URL: http://192.168.4.1"
 echo
-echo "To configure:"
-echo "1. Connect your device to 'SmartWardrobe-Setup' WiFi"
+echo "Setup Instructions:"
+echo "1. Connect your phone/laptop to 'SmartWardrobe-Setup' WiFi"
 echo "2. Open browser and go to http://192.168.4.1"
 echo "3. Enter your home WiFi credentials and API key"
+echo "4. Device will automatically switch to your WiFi"
 echo
-echo "Debug commands:"
-echo "  • Status check: sudo /usr/local/bin/smartwardrobe-debug.sh"
+echo "Manual Commands:"
+echo "  • Debug info: sudo smartwardrobe-debug"
+echo "  • Restart all: sudo smartwardrobe-restart-all"
+echo "  • Fix RFID: sudo fix-rfid"
+echo "  • RFID status: sudo rfid-status"
 echo "  • View logs: sudo journalctl -u smartwardrobe-server.service -f"
-echo "  • Restart services: sudo systemctl restart smartwardrobe-boot.service"
 echo
-echo "Log files: /var/log/smartwardrobe/"
-echo "Config: /etc/smartwardrobe/config.json"
+echo "Files:"
+echo "  • Logs: /var/log/smartwardrobe/"
+echo "  • Config: /etc/smartwardrobe/config.json"
+echo "  • App: /opt/smartwardrobe/"
 echo
 
-# Show any service failures
+# Show any critical failures
+CRITICAL_FAILURES=false
+
 if [ "$BOOT_STATUS" = "failed" ]; then
-    error "Boot service failed - check logs with: journalctl -u smartwardrobe-boot.service"
+    error "CRITICAL: Boot service failed!"
+    echo "  Fix with: sudo systemctl restart smartwardrobe-boot.service"
+    CRITICAL_FAILURES=true
 fi
 
 if [ "$SERVER_STATUS" = "failed" ]; then
-    error "Server service failed - check logs with: journalctl -u smartwardrobe-server.service"
+    error "CRITICAL: Web server failed!"
+    echo "  Fix with: sudo systemctl restart smartwardrobe-server.service"
+    CRITICAL_FAILURES=true
+fi
+
+if [ "$WATCHDOG_STATUS" = "failed" ]; then
+    error "CRITICAL: Watchdog failed!"
+    echo "  Fix with: sudo systemctl restart smartwardrobe-watchdog.service"
+    CRITICAL_FAILURES=true
 fi
 
 if [ "$RFID_STATUS" = "failed" ]; then
-    warn "RFID service failed - check logs with: journalctl -u smartwardrobe-rfid.service"
+    warn "RFID service failed - not critical for web setup"
+    echo "  Fix with: sudo fix-rfid"
 fi
 
-log "Installation script completed. Services should be running."
-log "If services are still failing, run: sudo /usr/local/bin/smartwardrobe-debug.sh"
+if [ "$CRITICAL_FAILURES" = true ]; then
+    error "Some critical services failed - run 'sudo smartwardrobe-debug' for details"
+    echo
+    echo "Common fixes:"
+    echo "  • sudo smartwardrobe-restart-all"
+    echo "  • sudo reboot"
+    exit 1
+fi
+
+log "Installation completed successfully!"
+log "Watchdog is now monitoring all services automatically"
+log "System ready for headless operation"
 
 echo
-echo "System will reboot in 15 seconds to ensure clean startup..."
+echo -e "${GREEN}SUCCESS: All systems operational!${NC}"
+echo
+echo "What happens next:"
+echo "  → Watchdog monitors everything every 30 seconds"
+echo "  → Auto-restarts any failed services"
+echo "  → Auto-resets RFID reader if it stops working"
+echo "  → Maintains AP mode or WiFi connection automatically"
+echo
+echo "For headless operation, this device is now fully autonomous!"
+echo
+echo "System will reboot in 15 seconds for clean startup..."
+echo "After reboot, connect to 'SmartWardrobe-Setup' WiFi to configure"
 sleep 15
 reboot
