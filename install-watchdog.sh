@@ -1,5 +1,23 @@
 #!/bin/bash
 
+echo "=== Installing Smart Wardrobe Watchdog Service ==="
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: This script must be run as root: sudo ./install-watchdog.sh"
+    exit 1
+fi
+
+LOG_DIR="/var/log/smartwardrobe"
+mkdir -p "$LOG_DIR"
+chmod 755 "$LOG_DIR"
+
+echo "Creating watchdog script..."
+
+# Create the main watchdog script
+cat > /usr/local/bin/smartwardrobe-watchdog.sh << 'WATCHDOG_SCRIPT'
+#!/bin/bash
+
 # Smart Wardrobe Watchdog Service
 # This service monitors and restarts failed services automatically
 
@@ -199,3 +217,143 @@ while true; do
         perform_system_health_check
     fi
 done
+WATCHDOG_SCRIPT
+
+# Make the watchdog script executable
+chmod +x /usr/local/bin/smartwardrobe-watchdog.sh
+
+echo "Creating RFID reset utilities..."
+
+# Create RFID reset script
+cat > /usr/local/bin/reset-acr122u.sh << 'RESET_SCRIPT'
+#!/bin/bash
+LOG_FILE="/var/log/smartwardrobe/rfid.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESET: $1" | tee -a "$LOG_FILE"
+}
+
+log "Resetting ACR122U due to read failures..."
+
+# Stop RFID service
+systemctl stop smartwardrobe-rfid.service
+
+# Reset USB device
+for device in /sys/bus/usb/devices/*; do
+    if [ -f "$device/idVendor" ] && [ -f "$device/idProduct" ]; then
+        vendor=$(cat "$device/idVendor" 2>/dev/null)
+        product=$(cat "$device/idProduct" 2>/dev/null)
+        if [ "$vendor" = "072f" ] && [ "$product" = "2200" ]; then
+            log "Resetting ACR122U USB device..."
+            echo 0 > "$device/authorized" 2>/dev/null || true
+            sleep 3
+            echo 1 > "$device/authorized" 2>/dev/null || true
+            sleep 5
+            break
+        fi
+    fi
+done
+
+# Restart PC/SC service
+log "Restarting PC/SC service..."
+systemctl restart pcscd
+sleep 5
+
+# Restart RFID service
+log "Restarting RFID service..."
+systemctl start smartwardrobe-rfid.service
+
+log "ACR122U reset complete"
+RESET_SCRIPT
+
+chmod +x /usr/local/bin/reset-acr122u.sh
+
+# Create quick RFID tools for manual use
+cat > /usr/local/bin/fix-rfid << 'FIX_RFID'
+#!/bin/bash
+echo "Fixing RFID reader..."
+/usr/local/bin/reset-acr122u.sh
+echo "RFID reader reset complete"
+FIX_RFID
+
+cat > /usr/local/bin/rfid-status << 'RFID_STATUS'
+#!/bin/bash
+echo "=== RFID Service Status ==="
+systemctl status smartwardrobe-rfid.service --no-pager -l
+echo
+echo "=== Recent RFID Logs ==="
+journalctl -u smartwardrobe-rfid.service -n 20 --no-pager
+echo
+echo "=== USB Device Status ==="
+lsusb | grep -i "072f\|advanced card"
+echo
+echo "=== PC/SC Status ==="
+timeout 5 pcsc_scan -n 2>/dev/null || echo "PC/SC scan failed"
+RFID_STATUS
+
+cat > /usr/local/bin/rfid-logs << 'RFID_LOGS'
+#!/bin/bash
+echo "=== Live RFID Logs ==="
+echo "Press Ctrl+C to exit"
+journalctl -u smartwardrobe-rfid.service -f
+RFID_LOGS
+
+chmod +x /usr/local/bin/fix-rfid
+chmod +x /usr/local/bin/rfid-status
+chmod +x /usr/local/bin/rfid-logs
+
+echo "Creating watchdog systemd service..."
+
+# Create the systemd service for the watchdog
+cat > /etc/systemd/system/smartwardrobe-watchdog.service << EOF
+[Unit]
+Description=Smart Wardrobe Watchdog Service
+After=multi-user.target network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smartwardrobe-watchdog.sh
+StandardOutput=append:$LOG_DIR/watchdog.log
+StandardError=append:$LOG_DIR/watchdog.log
+User=root
+Group=root
+Restart=always
+RestartSec=10
+
+# This service should never give up
+StartLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "Enabling and starting watchdog service..."
+
+# Reload systemd
+systemctl daemon-reload
+
+# Enable the watchdog service
+systemctl enable smartwardrobe-watchdog.service
+
+# Start the watchdog service
+systemctl start smartwardrobe-watchdog.service
+
+echo
+echo "=== Watchdog Service Installation Complete! ==="
+echo
+echo "Service Status:"
+systemctl status smartwardrobe-watchdog.service --no-pager -l
+echo
+echo "Watchdog Commands:"
+echo "  • Check status: sudo systemctl status smartwardrobe-watchdog.service"
+echo "  • View logs: sudo tail -f /var/log/smartwardrobe/watchdog.log"
+echo "  • Restart: sudo systemctl restart smartwardrobe-watchdog.service"
+echo
+echo "RFID Tools (if RFID service is enabled):"
+echo "  • Fix RFID reader: sudo fix-rfid"
+echo "  • Check RFID status: sudo rfid-status"
+echo "  • View RFID logs: sudo rfid-logs"
+echo
+echo "The watchdog will now monitor and restart failed services automatically!"
+echo "It checks every 30 seconds and will restart any dead services."
