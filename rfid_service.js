@@ -5,7 +5,7 @@ const http = require('http');
 
 // Configuration
 const CONFIG_PATH = '/etc/smartwardrobe/config.json';
-const BACKEND_URL = 'http://192.168.1.4:3001'; // Development backend
+const BACKEND_URL = 'http://192.168.1.7:3001'; // Development backend
 const SCAN_INTERVAL = 5000; // Scan every 5 seconds
 const HEARTBEAT_INTERVAL = 30000; // Heartbeat every 30 seconds
 const LOG_PATH = '/var/log/smartwardrobe/rfid.log';
