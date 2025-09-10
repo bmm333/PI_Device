@@ -8,7 +8,6 @@ const PORT = 80;
 const CONFIG_PATH = '/etc/smartwardrobe/config.json';
 const LOG_DIR = '/var/log/smartwardrobe';
 
-// Ensure log directory exists
 if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
@@ -216,7 +215,7 @@ const server = http.createServer((req, res) => {
     });
     
   } else {
-    // Captive portal redirect
+    // Captive portal redirect 
     if (parsedUrl.pathname !== '/' && !parsedUrl.pathname.startsWith('/api/')) {
       res.writeHead(302, { 'Location': '/' });
       res.end();
