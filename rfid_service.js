@@ -36,7 +36,7 @@ function sendToBackend(endpoint, data, apiKey) {
   return new Promise((resolve, reject) => {
     const fullUrl = `${BACKEND_URL}${endpoint}`;
     const payload = JSON.stringify(data);
-    const parsedUrl = url.parse(fullUrl); // Parse the URL properly
+    const parsedUrl = url.parse(fullUrl);
     
     const options = {
       hostname: parsedUrl.hostname,
@@ -50,7 +50,7 @@ function sendToBackend(endpoint, data, apiKey) {
       }
     };
 
-    const req = https.request(options, (res) => { // Use https.request instead of http.request
+    const req = https.request(options, (res) => {
       let body = '';
       res.on('data', (chunk) => body += chunk);
       res.on('end', () => {
@@ -72,7 +72,6 @@ function sendToBackend(endpoint, data, apiKey) {
   });
 }
 
-// Send heartbeat to backend
 async function sendHeartbeat(apiKey) {
   try {
     await sendToBackend('/rfid/heartbeat', {}, apiKey);
