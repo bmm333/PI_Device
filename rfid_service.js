@@ -1,16 +1,15 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const http = require('http');
+const https = require('https');
+const url = require('url');
 
-// Configuration
 const CONFIG_PATH = '/etc/smartwardrobe/config.json';
-const BACKEND_URL = 'https://esameweb.onrender.com'; // Development backend
-const SCAN_INTERVAL = 5000; // Scan every 5 seconds
-const HEARTBEAT_INTERVAL = 30000; // Heartbeat every 30 seconds
+const BACKEND_URL = 'https://esameweb.onrender.com'; 
+const SCAN_INTERVAL = 1000;
+const HEARTBEAT_INTERVAL = 20000; 
 const LOG_PATH = '/var/log/smartwardrobe/rfid.log';
 
-// Load configuration (API key from setup)
 function loadConfig() {
   try {
     const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -35,10 +34,14 @@ function log(level, message) {
 // Send data to backend
 function sendToBackend(endpoint, data, apiKey) {
   return new Promise((resolve, reject) => {
-    const url = `${BACKEND_URL}${endpoint}`;
+    const fullUrl = `${BACKEND_URL}${endpoint}`;
     const payload = JSON.stringify(data);
+    const parsedUrl = url.parse(fullUrl); // Parse the URL properly
     
     const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 443,
+      path: parsedUrl.path,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -47,7 +50,7 @@ function sendToBackend(endpoint, data, apiKey) {
       }
     };
 
-    const req = http.request(url, options, (res) => {
+    const req = https.request(options, (res) => { // Use https.request instead of http.request
       let body = '';
       res.on('data', (chunk) => body += chunk);
       res.on('end', () => {
