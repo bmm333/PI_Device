@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Wardrobe Setup</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Smart Wardrobe Setup</h1>
+            <div class="device-info">
+                <h3>Device Information</h3>
+                <p><strong>Serial:</strong> SW-0001</p>
+                <p><strong>Status:</strong> <span class="status-indicator">Ready for Setup</span></p>
+            </div>
+        </div>
+
+        <form id="setupForm" method="POST" action="/configure">
+            <div class="form-group">
+                <label for="ssid">WiFi Network Name (SSID):</label>
+                <input type="text" id="ssid" name="ssid" required placeholder="Enter your WiFi network name">
+            </div>
+
+            <div class="form-group">
+                <label for="password">WiFi Password:</label>
+                <input type="password" id="password" name="password" required placeholder="Enter WiFi password">
+                <button type="button" class="toggle-password" onclick="togglePassword()"></button>
+            </div>
+
+            <div class="form-group">
+                <label for="apiKey">API Key:</label>
+                <input type="text" id="apiKey" name="apiKey" required placeholder="Enter your Smart Wardrobe API key">
+            </div>
+
+            <button type="submit" id="submitBtn" class="submit-btn">
+                <span class="btn-text">Configure Device</span>
+                <span class="btn-loader" style="display: none;">⏳ Configuring...</span>
+            </button>
+        </form>
+
+        <div id="status" class="status-message"></div>
+
+        <div class="help-section">
+            <h3>Need Help?</h3>
+            <ul>
+                <li>Make sure you're connected to <strong>SmartWardrobe-Setup</strong> WiFi</li>
+                <li>Enter the exact WiFi name and password for your home network</li>
+                <li>Get your API key from the Smart Wardrobe mobile app</li>
+                <li>Device will automatically restart after configuration</li>
+            </ul>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
